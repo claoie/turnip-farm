@@ -3,7 +3,7 @@
 **Scope.** This document is the detailed backend design for `turnip-farm`,
 implementing the contract in the master plan
 (`https://github.com/hoiekim/turnip-farm/blob/main/docs/MASTER_PLAN.md`,
-merged Rev 3). It specifies the Postgres schema, index strategy, upsert
+Rev 5). It specifies the Postgres schema, index strategy, upsert
 semantics, the training-data export pattern, and the full REST API, at a
 level of detail intended to be implementable without guessing. Companion
 documents: the pose wire-format specification (`POSE_FORMAT.md`); the iOS
@@ -22,7 +22,8 @@ into an array column. This document resolves that inconsistency **in favor
 of the stated one-to-many hierarchy**:
 
 - **One label row per `(clip_id, trick_name)`.**
-- Each row carries its own `taxonomy_version`, `created_at`, `updated_at`.
+- Each row carries its own `origin` (§1.2.18), `taxonomy_version`,
+  `created_at`, `updated_at`.
 - Re-submission of a clip's labels **replaces the clip's whole label set in
   a single transaction** (DELETE existing rows for the clip, INSERT the new
   set). No merge logic, no array surgery.
@@ -160,6 +161,57 @@ Two departures from the master plan's label draft follow from this:
     and anyone holding an imported file can recompute its `video_id`.
     Whether that makes unlinked contributions personal data is a question
     for counsel (§9 Q9).
+    *Re-weighed and kept, 2026-10-15* (master plan §1). Linking would
+    buy complete account deletion, splits by person, per-labeler
+    reliability, and restore on any device; it would cost one
+    re-identified video identifying every other video under the same
+    account. The app's Profile tab needs no link (§1.2.21). Unlinking is
+    not a one-way door: the client keeps every source's key, so a future
+    opt-in "link my contributions" call, taking source keys, can re-link
+    the sources whose keys it still holds, on the user's say. *Reopen
+    if:* counsel answers §9 Q9 that unlinked pose sequences are personal
+    data anyway, or a social feature is put on the roadmap. A reversal
+    lands before the first deployment, while restoring `sources.user_id`
+    is a plain additive migration.
+18. **Labels carry provenance, never identity.** Each label row records
+    its `origin`: `typed` (typed by hand), `vocabulary` (picked from the
+    vocabulary's suggestions), or `model` (pre-filled by the trick model
+    and kept). Each clip records `proposal_model_version` (the
+    `models.version` that proposed its window or names; NULL for the
+    heuristic detector or a manual clip), `suggested_names` (the names
+    that model pre-filled — or, on a blind clip, would have — kept or
+    removed, so a removed suggestion is a known disagreement;
+    `MODEL_CONTRACT.md` §3.3), and `suggestions_withheld` (the client
+    showed no model names for this clip: the blind sample, master plan
+    §6).
+    Training needs all four to tell a name the user gave from a
+    suggestion the user let stand (`TRAINING_DESIGN.md`). They are
+    client-reported and unverifiable, like the names themselves, and
+    describe how a label was made, not who made it.
+    `proposal_model_version` is TEXT without a foreign key: a client
+    can report a version the farm has since rolled back past, and
+    `models` rows are never deleted anyway.
+19. **The manifest and the vocabulary are public.**
+    `GET /api/models/current` and `GET /api/taxonomy/current` need no
+    session (§7.1). Neither holds
+    anything user-specific, and the app has to reach both for users who
+    never sign in: naming and the Profile work without an account, and
+    a model that only signed-in users could download would leave
+    everyone else on the heuristic detector. Both are rate-limited per
+    client IP.
+20. **Training membership is source-level.** `model_training_sources`
+    records which sources trained each promoted model, so an owner can
+    see that their contribution went into a model
+    (`GET /api/sources/:id` → `trained_in`). The pipeline sends the list
+    with `POST /api/models`. It holds no account and cascades with the
+    source; ids of sources deleted between training and publish are
+    skipped, not rejected.
+21. **No profile state.** The app's Profile tab (achievements, levels,
+    progress, the gallery, highlights) is computed on the device and
+    never sent here (master plan §1). There is no profile,
+    achievement, score, or leaderboard table, and adding one needs the
+    master plan's reopen condition first: it would have to know whose
+    contributions are whose, which §1.2.17 removes.
 
 ## 2. Conventions
 
@@ -271,8 +323,21 @@ CREATE TABLE clips (
   -- end_frame <= sources.frame_count is enforced at the API layer
   -- (cross-table CHECKs are not expressible in Postgres).
   auto_detected BOOLEAN NOT NULL DEFAULT FALSE,
+  proposal_model_version TEXT,
+  -- models.version of the trick model that proposed this clip's window or
+  -- names; NULL for the heuristic detector or a manual clip (§1.2.18).
+  suggested_names TEXT[] NOT NULL DEFAULT '{}',
+  -- The names that model pre-filled for the clip, kept or removed. On a
+  -- blind-sample clip, the names it would have pre-filled.
+  suggestions_withheld BOOLEAN NOT NULL DEFAULT FALSE,
+  -- Blind sample: the client showed no model names for this clip, so its
+  -- labels are independent of the model (master plan §6).
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT clips_suggestions_need_model CHECK (
+    proposal_model_version IS NOT NULL OR
+    (cardinality(suggested_names) = 0 AND NOT suggestions_withheld)
+  )
 );
 CREATE INDEX clips_source_id_idx ON clips (source_id);
 
@@ -283,6 +348,10 @@ CREATE TABLE labels (
                    CHECK (trick_name <> '' AND trick_name = btrim(trick_name)),
   -- Free text, stored trimmed and verbatim (casing preserved).
   -- Canonicalization happens at training-curation time via label_taxonomy.
+  origin           TEXT NOT NULL DEFAULT 'typed'
+                   CHECK (origin IN ('typed', 'vocabulary', 'model')),
+  -- How this name was given (§1.2.18): typed by hand, picked from the
+  -- vocabulary's suggestions, or pre-filled by the trick model and kept.
   taxonomy_version INTEGER NOT NULL,
   -- Vocabulary version in effect when THIS name was confirmed.
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -330,10 +399,22 @@ CREATE TABLE models (
   training_run_id  TEXT,
   -- Training-pipeline run that produced this version (provenance).
   val_metrics      JSONB NOT NULL DEFAULT '{}',
+  name_metrics     JSONB NOT NULL DEFAULT '{}',
+  -- Per canonical name: holdout precision and recall plus holdout_count and
+  -- train_count (example counts), e.g. {"gainer": {"precision": 0.9,
+  -- "recall": 0.84, "holdout_count": 31, "train_count": 412}}. Shipped in
+  -- the manifest as the app's impact feedback (master plan §6).
   promoted_at      TIMESTAMPTZ,
   -- NULL = trained but not champion. The current model is the row with the
   -- greatest non-null promoted_at.
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE model_training_sources (
+  model_version TEXT NOT NULL REFERENCES models(version),
+  source_id     CHAR(64) NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  -- The sources a promoted model trained on (§1.2.20). No account column.
+  PRIMARY KEY (source_id, model_version)
 );
 
 CREATE TABLE data_quarantine (
@@ -387,7 +468,23 @@ ON CONFLICT (raw, taxonomy_version) DO NOTHING;
 ```
 
 (The real seed list comes from the standard tricking vocabulary; the
-curation process itself is a separate concern — master plan §9 Q1.)
+curation process itself is a separate concern — master plan §9 Q1. The
+iOS app bundles the same list as its offline vocabulary seed, so it can
+suggest and group names before it ever reaches the farm.)
+
+**Renames resolve forward.** Every canonical name is also a `raw` row
+mapping to itself, as in the seed. Renaming a canonical name therefore
+adds, at the new version, a row for every raw string that mapped to the
+old canonical — the old canonical itself included — pointing at the new
+one, plus the new canonical mapping to itself. Renaming `cartfull` to
+`cart full` at version 5 adds `('cartfull', 'cart full', 5)` and
+`('cart full', 'cart full', 5)`, and the same for every other alias of
+`cartfull`. Labels given under the old name, and the app's achievements
+counted on it, then resolve to the new one through the usual
+greatest-version lookup instead of falling out of the vocabulary.
+Remapping only the old canonical is not enough: an alias left at its
+old version still points at the old name, which the vocabulary then
+lists as a canonical of its own.
 
 ## 4. Upsert semantics
 
@@ -466,15 +563,22 @@ extends the link.
 
 ```sql
 INSERT INTO clips
-  (id, source_id, start_frame, end_frame, auto_detected, updated_at)
+  (id, source_id, start_frame, end_frame, auto_detected,
+   proposal_model_version, suggested_names, suggestions_withheld, updated_at)
 VALUES (...), (...)
 ON CONFLICT (id) DO UPDATE SET
-  source_id     = EXCLUDED.source_id,
-  start_frame   = EXCLUDED.start_frame,
-  end_frame     = EXCLUDED.end_frame,
-  auto_detected = EXCLUDED.auto_detected,
-  updated_at    = now();
+  source_id              = EXCLUDED.source_id,
+  start_frame            = EXCLUDED.start_frame,
+  end_frame              = EXCLUDED.end_frame,
+  auto_detected          = EXCLUDED.auto_detected,
+  proposal_model_version = EXCLUDED.proposal_model_version,
+  suggested_names        = EXCLUDED.suggested_names,
+  suggestions_withheld   = EXCLUDED.suggestions_withheld,
+  updated_at             = now();
 ```
+
+The provenance columns are replaced like the window: the client's
+current record of the clip is the truth (§1.2.18).
 
 **`labels`** — never upserted per-row; the whole set per clip is replaced
 (§5).
@@ -493,10 +597,23 @@ ON CONFLICT (raw, taxonomy_version) DO NOTHING;
 INSERT INTO models
   (version, taxonomy_version, r2_key, sha256, byte_size, min_client_version,
    input_desc, output_desc, holdout_report_r2_key, training_run_id,
-   val_metrics, promoted_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+   val_metrics, name_metrics, promoted_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
 ON CONFLICT (version) DO NOTHING;
 -- rowcount 0 → 409 VERSION_EXISTS
+```
+
+**`model_training_sources`** — written in the same transaction as the
+`models` insert, only when that insert added a row:
+
+```sql
+INSERT INTO model_training_sources (model_version, source_id)
+SELECT $1, s.id
+FROM sources s
+WHERE s.id = ANY($2::char(64)[])
+ON CONFLICT DO NOTHING;
+-- $2 = training_source_ids from POST /api/models; ids of sources deleted
+-- since the training run match no row and are skipped (§1.2.20).
 ```
 
 **`data_quarantine`** — plain append-only `INSERT`; the partial unique
@@ -516,20 +633,22 @@ SELECT max(taxonomy_version) INTO v_tax FROM label_taxonomy;
 
 -- 2. clip upserts (§4)
 
--- 3. per clip in the batch:
+-- 3. per clip in the batch; $2 is the clip's labels as sent,
+--    [{"name": "cork", "origin": "vocabulary"}, ...]:
 DELETE FROM labels WHERE clip_id = $1;
-INSERT INTO labels (clip_id, trick_name, taxonomy_version)
-SELECT $1, deduped.name, v_tax
+INSERT INTO labels (clip_id, trick_name, origin, taxonomy_version)
+SELECT $1, deduped.name, deduped.origin, v_tax
 FROM (
-  SELECT DISTINCT ON (lower(trim(name))) trim(name) AS name
-  FROM unnest($2::text[]) AS name
-  WHERE trim(name) <> ''
-  ORDER BY lower(trim(name)), trim(name)
+  SELECT DISTINCT ON (lower(trim(l.name))) trim(l.name) AS name, l.origin
+  FROM jsonb_to_recordset($2::jsonb) AS l(name text, origin text)
+  WHERE trim(l.name) <> ''
+  ORDER BY lower(trim(l.name)), trim(l.name), l.origin
 ) AS deduped;
 -- (empty array → DELETE only; the clip is left unlabeled)
 -- Dedup on lower(trim(name)) BEFORE insert: the unique index on
 -- (clip_id, lower(trick_name)) rejects duplicates, it does not collapse
--- them. DISTINCT ON keeps the alphabetically-first casing per group.
+-- them. DISTINCT ON keeps the alphabetically-first casing per group and,
+-- for that casing, the alphabetically-first origin.
 
 COMMIT;
 ```
@@ -557,7 +676,11 @@ SELECT s.id            AS source_id,
        c.id            AS clip_id,
        c.start_frame,
        c.end_frame,
+       c.proposal_model_version,
+       c.suggested_names,
+       c.suggestions_withheld,
        l.trick_name,                    -- raw; canonicalized via label_taxonomy
+       l.origin,
        l.taxonomy_version,
        GREATEST(s.updated_at, c.updated_at, l.updated_at) AS row_cursor
 FROM sources s
@@ -596,6 +719,14 @@ Notes:
   before deciding to train.
 - No account identifier is exported (§1.2.17). Training splits by
   source.
+- Provenance (§1.2.18) rides on every row: `origin` per label, and the
+  clip's `proposal_model_version`, `suggested_names` and
+  `suggestions_withheld` repeated on each of its label rows. The app
+  contributes a clip only once it has at least one name
+  (`CONTRIBUTION_DESIGN.md` §3.3), so a clip whose suggestions were all
+  removed still exports through the name the user gave instead; only a
+  clip whose label set was later cleared to `[]` drops out, with its
+  provenance.
 - Canonicalization (`raw → canonical`) happens in the training job using
   the `taxonomy` block shipped with the export response (§7,
   `GET /api/labels/export`), not in SQL.
@@ -647,6 +778,11 @@ service key, `Authorization: Bearer <TURNIP_PIPELINE_KEY>`.
 
 **Apple** (`POST /api/auth/apple/notifications`): no bearer token; the
 body is a JWT signed by Apple, verified as below.
+
+**Public** (`GET /api/models/current`, `GET /api/taxonomy/current`): no
+bearer token and no user (§1.2.19). A client that has a session may
+send it; the farm ignores it on these two endpoints, so a request never
+ties a manifest or vocabulary fetch to an account.
 
 **Verifying an Apple JWT.** The identity token at sign-in, the `id_token`
 returned by the code exchange, and server-to-server notifications are
@@ -742,7 +878,9 @@ for `users.apple_refresh_token`).
 - **Rate limiting:** per-user token bucket on POST endpoints
   (suggested: 60 requests/minute; `429 RATE_LIMITED` with
   `Retry-After`). `POST /api/auth/apple` has no user yet, so it is
-  limited per client IP (suggested: 10 requests/minute).
+  limited per client IP (suggested: 10 requests/minute), and so are
+  the two public endpoints (suggested: 30 requests/minute; both are
+  cacheable, see §7.3).
 
 ### 7.3 Endpoints
 
@@ -939,12 +1077,20 @@ Request:
       "source_key": "<the source's key>",
       "start_frame": 120,
       "end_frame": 175,
-      "auto_detected": false,
-      "labels": ["cork"]
+      "auto_detected": true,
+      "proposal_model_version": "trick-v1.3",
+      "suggested_names": ["cork", "gainer"],
+      "suggestions_withheld": false,
+      "labels": [{"name": "cork", "origin": "model"}]
     }
   ]
 }
 ```
+
+`proposal_model_version` (default `null`), `suggested_names` (default
+`[]`) and `suggestions_withheld` (default `false`) are the clip's
+provenance (§1.2.18). Each `labels` entry is an object; `origin` is
+required, one of `typed | vocabulary | model`.
 
 Behavior, in a single transaction:
 
@@ -954,6 +1100,11 @@ Behavior, in a single transaction:
    `404 NOT_FOUND`.
 2. `0 <= start_frame < end_frame <= source.frame_count`, else
    `422 VALIDATION_ERROR` (with the batch index and field in `details`).
+   Also `422`: an `origin` outside the three values; a non-empty
+   `suggested_names`, `suggestions_withheld: true`, or a label with
+   `origin: "model"` on a clip with no `proposal_model_version`; or a
+   label with `origin: "model"` on a clip with
+   `suggestions_withheld: true` (nothing was shown to keep).
 3. **Blob verification** (once per distinct source in the batch): the
    canonical blob must be ingested — `sources.sha256 IS NULL` →
    `422 BLOB_MISSING` (the client waits for ingest, re-uploads via
@@ -971,7 +1122,7 @@ Response `200`:
 ```json
 {
   "clips": [
-    {"clip_id": "<uuid>", "labels": ["cork"], "taxonomy_version": 3}
+    {"clip_id": "<uuid>", "labels": [{"name": "cork", "origin": "model"}], "taxonomy_version": 3}
   ]
 }
 ```
@@ -984,18 +1135,27 @@ case-insensitive duplicates are deduped before insert (§5).
 Request:
 
 ```json
-{"source_key": "<the key of the clip's source>", "labels": ["hook", "scoot", "gainer", "cartfull"]}
+{
+  "source_key": "<the key of the clip's source>",
+  "labels": [
+    {"name": "hook", "origin": "vocabulary"},
+    {"name": "scoot", "origin": "vocabulary"},
+    {"name": "gainer", "origin": "typed"},
+    {"name": "cartfull", "origin": "vocabulary"}
+  ]
+}
 ```
 
 Behavior: the clip must exist and `source_key` must match its source
-(`404` otherwise); runs the §5 replacement for that clip only and
-records the caller in `source_attribution` (§4). Idempotent: submitting
-the current set is a no-op semantically.
+(`404` otherwise); labels validate as in `POST /api/clips` against the
+clip's stored provenance; runs the §5 replacement for that clip only
+and records the caller in `source_attribution` (§4). Idempotent:
+submitting the current set is a no-op semantically.
 
 Response `200`:
 
 ```json
-{"clip_id": "<uuid>", "labels": ["hook", "scoot", "gainer", "cartfull"], "taxonomy_version": 3}
+{"clip_id": "<uuid>", "labels": [{"name": "hook", "origin": "vocabulary"}, "..."], "taxonomy_version": 3}
 ```
 
 There is no "list my sources" endpoint: the farm doesn't know which
@@ -1015,6 +1175,7 @@ key doesn't match):
     "sample_rate": 10.0,
     "keypoint_format": "tkp1",
     "sha256": "<canonical blob digest; null until ingested>",
+    "trained_in": ["trick-v1.3", "trick-v1.4"],
     "created_at": "2026-10-06T07:00:00Z",
     "updated_at": "2026-10-06T07:00:00Z"
   },
@@ -1023,9 +1184,12 @@ key doesn't match):
       "id": "<uuid>",
       "start_frame": 120,
       "end_frame": 175,
-      "auto_detected": false,
+      "auto_detected": true,
+      "proposal_model_version": "trick-v1.3",
+      "suggested_names": ["cork", "gainer"],
+      "suggestions_withheld": false,
       "labels": [
-        {"trick_name": "cork", "taxonomy_version": 3, "created_at": "..."}
+        {"name": "cork", "origin": "model", "taxonomy_version": 3, "created_at": "..."}
       ]
     }
   ]
@@ -1037,6 +1201,12 @@ keys left in its Keychain (stored per `video_id`), recomputes the
 `video_id`s of the videos it still has, and pulls each matching
 source's clips + labels, adopting the server's clip IDs into its
 rebuilt local state (master plan §5.1).
+
+It is also the impact read. `trained_in` lists the promoted model
+versions whose training set held this source (`model_training_sources`,
+§1.2.20), oldest first; `[]` until a model trains on it. The app reads
+it for the sources it holds keys for, to tell the user which models
+their contributions went into.
 
 #### `GET /api/sources/:id/pose` — owner-only pose blob download
 
@@ -1066,7 +1236,7 @@ by whoever holds the key.
 
 #### `GET /api/models/current` — trick-model manifest
 
-Response `200`:
+Public: no session (§7.1). Response `200`:
 
 ```json
 {
@@ -1079,10 +1249,14 @@ Response `200`:
   "byte_size": 48203110,
   "min_client_version": "2.4.0",
   "input_desc": {"layout": "T×52", "channels": "gap-channel pose features", "rate_hz": 10},
-  "output_desc": {"segments": "source-frame coordinates", "trick_names": "string[]", "is_combo": "derived"},
+  "output_desc": {"segments": "source-frame coordinates", "trick_names": "string[]", "name_scores": "number[]", "is_combo": "derived"},
   "holdout_report_r2_key": "reports/trick-v1.2-holdout.json",
   "training_run_id": "run-20261006-01",
   "val_metrics": {"seg_map_05": 0.62, "name_accuracy": 0.81},
+  "name_metrics": {
+    "cork": {"precision": 0.88, "recall": 0.79, "holdout_count": 24, "train_count": 310},
+    "gainer": {"precision": 0.9, "recall": 0.84, "holdout_count": 31, "train_count": 412}
+  },
   "vocabulary": [
     {"canonical": "cork", "aliases": ["cork", "corkscrew"]},
     {"canonical": "gainer", "aliases": ["gainer"]}
@@ -1093,8 +1267,41 @@ Response `200`:
 
 `vocabulary` is built from `label_taxonomy` at the model's
 `taxonomy_version`: one entry per canonical name, `aliases` = every raw
-string mapped to it. The client verifies the download against `sha256`
-before installing. `404 NO_MODEL` when nothing has been promoted yet.
+string mapped to it. `name_metrics` is the `models` column as published
+(§3): per canonical name the model knows, holdout precision and recall
+and the holdout and training example counts — the app's "how well the
+model knows this trick", and its list of tricks the model is still
+learning. The client verifies the download against `sha256` before
+installing. `404 NO_MODEL` when nothing has been promoted yet.
+
+The response is the same for every caller until the next promotion, so
+it is served with an `ETag` of the model `version` and
+`Cache-Control: max-age=300`. The presigned `url` inside it is valid
+for 15 minutes, longer than the cache lifetime.
+
+#### `GET /api/taxonomy/current` — the current vocabulary
+
+Public: no session (§7.1). The vocabulary at the farm's current
+`taxonomy_version` (§1.2.8), independent of any model, so the app can
+suggest and group names before the first promotion and pick up
+curation between promotions. Response `200`:
+
+```json
+{
+  "taxonomy_version": 7,
+  "vocabulary": [
+    {"canonical": "cork", "aliases": ["cork", "corkscrew"]},
+    {"canonical": "gainer", "aliases": ["gainer"]}
+  ]
+}
+```
+
+Same entry shape as the manifest's `vocabulary`, assembled the same way:
+each raw string resolves through its greatest `taxonomy_version`
+mapping (so a renamed canonical lists its old name as an alias, §3).
+Served with an `ETag` of the `taxonomy_version` and
+`Cache-Control: max-age=3600`. Always `200`: the seed migration defines
+version 1.
 
 #### `POST /api/models` — pipeline publishes the champion (service key)
 
@@ -1109,16 +1316,25 @@ Request:
   "byte_size": 48203110,
   "min_client_version": "2.4.0",
   "input_desc": {"layout": "T×52", "channels": "gap-channel pose features", "rate_hz": 10},
-  "output_desc": {"segments": "source-frame coordinates", "trick_names": "string[]", "is_combo": "derived"},
+  "output_desc": {"segments": "source-frame coordinates", "trick_names": "string[]", "name_scores": "number[]", "is_combo": "derived"},
   "holdout_report_r2_key": "reports/trick-v1.2-holdout.json",
   "training_run_id": "run-20261006-01",
-  "val_metrics": {"seg_map_05": 0.62, "name_accuracy": 0.81}
+  "val_metrics": {"seg_map_05": 0.62, "name_accuracy": 0.81},
+  "name_metrics": {
+    "gainer": {"precision": 0.9, "recall": 0.84, "holdout_count": 31, "train_count": 412}
+  },
+  "training_source_ids": ["<64-char hex>", "..."]
 }
 ```
 
-Behavior: inserts per §4 with `promoted_at = now()`; an existing
-`version` → `409 VERSION_EXISTS` (bump the version instead). Response
-`201`: `{"id": "<uuid>", "version": "...", "promoted_at": "..."}`.
+Behavior: inserts per §4 with `promoted_at = now()`, and in the same
+transaction records `training_source_ids` in `model_training_sources`
+(§4), skipping ids whose source no longer exists. An existing
+`version` → `409 VERSION_EXISTS` (bump the version instead), with
+nothing recorded. A rollback publish (`TRAINING_DESIGN.md` §8) sends
+the re-promoted champion's own source list. Response `201`:
+`{"id": "<uuid>", "version": "...", "promoted_at": "...",
+"training_sources_recorded": 1287}`.
 
 #### `GET /api/labels/export?since=` — training pull (service key)
 
@@ -1137,7 +1353,11 @@ sources excluded, ordered by cursor ascending, `limit` 10000:
       "clip_id": "<uuid>",
       "start_frame": 120,
       "end_frame": 175,
+      "proposal_model_version": "trick-v1.3",
+      "suggested_names": ["cork", "gainer"],
+      "suggestions_withheld": false,
       "trick_name": "cork",
+      "origin": "model",
       "taxonomy_version": 3
     }
   ],
@@ -1179,6 +1399,10 @@ checklist:
 - No Apple profile data beyond the `sub` claim: no name, no email.
   Identity tokens and email notifications carry an email address; it is
   discarded unread.
+- No app profile state: no achievements, levels, progress, scores,
+  gallery grouping, highlights, favorites, spots, or which clips show
+  the user (§1.2.21). Provenance fields (§1.2.18) say how a label was
+  made, never who made it.
 - R2 keys contain only the opaque source ID
   (`poses/<video_id>.tkp1.gz`); presigned URLs are per-request,
   single-blob, short-lived.
@@ -1242,7 +1466,13 @@ checklist:
    against a public video of the person in them, and an imported
    file's `video_id` can be recomputed by anyone holding the file
    (§1.2.17). Counsel should confirm whether that leaves them personal
-   data.
+   data. The answer is now also a reopen trigger for unlinking itself:
+   if unlinked pose sequences are personal data anyway, linking may be
+   the better trade (§1.2.17).
 10. **Log and backup retention.** §8 caps logs and database backups at
     30 days; the deployment runbook has to implement that for Postgres
     backups, the farm's logs, and the reverse proxy's access logs.
+11. **Landed or bailed.** An optional per-clip `outcome`
+    (`landed | bailed`) is undecided (master plan §9 Q4). It would be
+    one more nullable `clips` column and one more optional field on
+    `POST /api/clips`, additive whenever it lands.
