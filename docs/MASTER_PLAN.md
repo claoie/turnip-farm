@@ -59,7 +59,7 @@ flowchart TB
     subgraph Device["iOS device — private zone"]
         A["Capture / import video<br/>(deterministic video_id)"]
         B["On-device pose<br/>MoveNet Thunder"]
-        C["Clip editor<br/>adjust windows + free-text trick names"]
+        C["Clip list + editor, then Name Clips<br/>adjust windows · free-text trick names"]
         P["Profile — private training log<br/>achievements · gallery · highlights"]
         D["User opts in per clip + confirms"]
     end
@@ -391,11 +391,13 @@ draft clips).
    the Photos library and recompute video_ids → for each match,
    `GET /api/sources/:id` with its key to pull confirmed clips + labels
    and rebuild local state, adopting the server's clip IDs.
-2. **Clip editor (where labeling lives).** The detector (heuristic now,
+2. **Clip flow (where labeling lives).** The detector (heuristic now,
    trick model later) proposes clip windows, or the user creates them
-   manually. The user adjusts windows and adds **free-text trick names —
-   the UI prompts for the trick name and accepts multiple labels per
-   clip**. Naming is part of the core clip flow, not of contribution:
+   manually. The user adjusts windows in the clip editor, then names the
+   clips on a naming step before they are saved — **free-text trick
+   names; the UI prompts for the trick name and accepts multiple labels
+   per clip** — or saves without names and names them later from the
+   Profile. Naming is part of the core clip flow, not of contribution:
    every saved clip can carry names, contributed or not, because the
    Profile (§5.6) is built from them. The client records each name's
    `origin` as it is given.
