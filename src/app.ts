@@ -24,7 +24,7 @@ import { handlePostReport } from "./reports";
 import { errorResponse } from "./errors";
 import { isVideoId } from "./contrib/validate";
 import type { R2Client } from "./r2/client";
-import { TokenBucket } from "./ratelimit";
+import { TokenBucket, clientAddress } from "./ratelimit";
 
 export interface RateLimits {
   /** Per-user token bucket for the contribution POSTs and POST /api/reports (§7.2). */
@@ -126,7 +126,7 @@ export function startServer(port: number, deps: AppDeps) {
         req.method === "POST" &&
         (pathname === "/api/auth/apple" || pathname === "/api/auth/apple/notifications")
       ) {
-        const ip = server.requestIP(req)?.address ?? "unknown";
+        const ip = clientAddress(server.requestIP(req)?.address, req.headers.get("x-forwarded-for"));
         if (!deps.limits.ip.take(ip)) {
           return errorResponse(429, "RATE_LIMITED", "Too many requests", {
             headers: { "Retry-After": String(deps.limits.ip.retryAfterSec(ip)) },
@@ -139,7 +139,7 @@ export function startServer(port: number, deps: AppDeps) {
         req.method === "GET" &&
         (pathname === "/api/taxonomy/current" || pathname === "/api/models/current")
       ) {
-        const ip = server.requestIP(req)?.address ?? "unknown";
+        const ip = clientAddress(server.requestIP(req)?.address, req.headers.get("x-forwarded-for"));
         if (!deps.limits.publicIp.take(ip)) {
           return errorResponse(429, "RATE_LIMITED", "Too many requests", {
             headers: { "Retry-After": String(deps.limits.publicIp.retryAfterSec(ip)) },

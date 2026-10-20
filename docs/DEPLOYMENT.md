@@ -78,7 +78,8 @@ flowchart LR
   automatic certificates work with no extra setup. The cost is no
   Cloudflare DDoS shielding and a public origin address. Proxying can be
   turned on later (SSL mode *Full (strict)*, Caddy `trusted_proxies`
-  set to Cloudflare's ranges).
+  set to Cloudflare's ranges, and the farm's client-address rule
+  changed to match, §3 item 1).
 - **Cloudflare R2** holds pose blobs and model artifacts, never video
   (master plan §1). A second, private bucket holds encrypted database
   backups (§7.3); the farm process never sees it.
@@ -112,16 +113,16 @@ size works with swap (§4.2).
 Found while writing this runbook. None is fixed here; each needs its own
 issue (and a design change first where it touches the schema or API).
 
-1. **Per-IP rate limits become global behind Caddy.** `src/app.ts` keys
-   the sign-in, notification and public-GET buckets
-   (`BACKEND_DESIGN.md` §7.2) on `server.requestIP(req)`. Behind Caddy
-   on loopback that is `127.0.0.1` for every request, so on day one the
-   whole user base shares one bucket: 10 sign-ins a minute and 30
-   vocabulary fetches a minute, total. Caddy's `reverse_proxy` already
-   sets `X-Forwarded-For` to the real client address and discards
-   client-supplied values unless `trusted_proxies` is configured, so the
-   fix is small: when the peer is loopback, take the client address from
-   `X-Forwarded-For`. **Recommended before first deployment.**
+1. **Per-IP rate limits behind Caddy (fixed).** The sign-in,
+   notification and public-GET buckets (`BACKEND_DESIGN.md` §7.2) keyed
+   on the socket peer, which behind Caddy on loopback is `127.0.0.1` for
+   every request, so the whole user base would have shared one bucket.
+   When the peer is loopback, the farm now takes the client address from
+   the first `X-Forwarded-For` entry (`clientAddress` in
+   `src/ratelimit.ts`). That relies on Caddy's default of discarding
+   client-supplied `X-Forwarded-For` values: configuring
+   `trusted_proxies`, or proxying through Cloudflare (§2), makes the
+   first entry client-controlled, so change that rule first.
 2. **The farm listens on every interface.** `Bun.serve` is started with
    a port and no hostname, so port 3000 is reachable from the internet
    unless a firewall stops it. §4.2 denies it in two places. An optional
@@ -396,6 +397,8 @@ documentation; Ubuntu's own package lags). Then:
 
 farm.example.com {
 	encode zstd gzip
+	# The farm keys per-IP rate limits on the X-Forwarded-For this sets.
+	# Don't add trusted_proxies without changing that first (§3 item 1).
 	reverse_proxy 127.0.0.1:3000
 
 	# Access log to stderr, so journald holds it (§7.1). Caddy redacts

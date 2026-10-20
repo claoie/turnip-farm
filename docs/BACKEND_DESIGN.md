@@ -902,7 +902,9 @@ for `users.apple_refresh_token`).
   `Retry-After`). `POST /api/auth/apple` has no user yet, so it is
   limited per client IP (suggested: 10 requests/minute), and so are
   the two public endpoints (suggested: 30 requests/minute; both are
-  cacheable, see §7.3).
+  cacheable, see §7.3). The client IP is the socket peer's address, or
+  the first `X-Forwarded-For` entry when the peer is loopback (a reverse
+  proxy on the same host).
 
 ### 7.3 Endpoints
 

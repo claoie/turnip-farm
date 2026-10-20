@@ -314,6 +314,30 @@ describe("startServer", () => {
     }
   });
 
+  test("behind a loopback proxy, per-IP buckets key on X-Forwarded-For", async () => {
+    const limited = startServer(0, {
+      ...deps,
+      limits: {
+        user: new TokenBucket(1000, 60000),
+        ip: new TokenBucket(1000, 60000),
+        publicIp: new TokenBucket(2, 1),
+      },
+    });
+    try {
+      // The test client connects from loopback, as Caddy does in production.
+      const url = new URL("/api/taxonomy/current", limited.url);
+      const get = (client: string) => fetch(url, { headers: { "X-Forwarded-For": client } });
+      // 500 means the request passed the limiter (noDatabase throws).
+      expect((await get("203.0.113.7")).status).toBe(500);
+      expect((await get("203.0.113.7")).status).toBe(500);
+      expect((await get("203.0.113.7")).status).toBe(429);
+      // Another client behind the same proxy has its own bucket.
+      expect((await get("198.51.100.2")).status).toBe(500);
+    } finally {
+      limited.stop(true);
+    }
+  });
+
   test("turns an unexpected error into 500 INTERNAL, logging the error but not the request", async () => {
     const logged = spyOn(console, "error").mockImplementation(() => {});
     try {
