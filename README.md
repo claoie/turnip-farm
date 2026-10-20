@@ -67,7 +67,7 @@ src/
   index.ts         entry point: loads config; starts the server, purge, and ingest poller
   app.ts           HTTP routing
   errors.ts        the API error shape (BACKEND_DESIGN.md §7.2)
-  ratelimit.ts     per-user and per-IP token buckets (§7.2)
+  ratelimit.ts     per-user and per-IP token buckets, and the client address they key on (§7.2)
   db.ts            transaction helper
   config.ts        env-based configuration; fails fast on missing variables
   auth/

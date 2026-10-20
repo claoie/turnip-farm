@@ -110,8 +110,9 @@ size works with swap (§4.2).
 
 ## 3. Code gaps this runbook depends on
 
-Found while writing this runbook. None is fixed here; each needs its own
-issue (and a design change first where it touches the schema or API).
+Found while writing this runbook, which fixes none of them; each needs
+its own issue (and a design change first where it touches the schema or
+API). Items fixed since are marked.
 
 1. **Per-IP rate limits behind Caddy (fixed).** The sign-in,
    notification and public-GET buckets (`BACKEND_DESIGN.md` §7.2) keyed
