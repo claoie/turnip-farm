@@ -28,6 +28,10 @@ The design documents are the contract. Read them before changing behavior:
 - [`docs/POSE_FORMAT.md`](docs/POSE_FORMAT.md): the `TKP1` pose wire and
   storage format.
 
+Deploying is covered by [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), the
+production runbook. It is a draft: nothing is deployed yet, and it lays
+out the open ops decisions rather than settling them.
+
 ## Status
 
 Early. The service starts, validates its configuration, and serves
