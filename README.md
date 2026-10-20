@@ -30,10 +30,9 @@ The design documents are the contract. Read them before changing behavior:
 
 ## Status
 
-Every BACKEND_DESIGN.md §7.3 endpoint is in place except the model
-registry (`POST /api/models` and `GET /api/models/current`, issue #10).
-The service validates its configuration and serves `GET /healthz`; the
-Postgres schema (§3) is in place as dbmate migrations.
+Every BACKEND_DESIGN.md §7.3 endpoint is in place. The service validates
+its configuration and serves `GET /healthz`; the Postgres schema (§3) is
+in place as dbmate migrations.
 
 - **Accounts (§7.1):** Sign in with Apple and farm sessions
   (`POST /api/auth/apple`, `POST /api/auth/signout`), account deletion
@@ -45,8 +44,9 @@ Postgres schema (§3) is in place as dbmate migrations.
   ownership (§7.2). An ingest worker polls R2 and turns each staged
   upload into the canonical 10 Hz blob (§1.2.10).
 - **Training:** the vocabulary (`GET /api/taxonomy/current`), the
-  label export (`GET /api/labels/export`), and the quarantine flow
-  (`POST /api/quarantine` with its release and purge calls).
+  label export (`GET /api/labels/export`), the quarantine flow
+  (`POST /api/quarantine` with its release and purge calls), and the
+  model registry (`POST /api/models`, `GET /api/models/current`).
 - **Moderation:** `POST /api/reports`, and maintainer scripts to resolve
   a source to its account within the attribution window and to block or
   unblock an account (see [Moderation](#moderation)). Blocked accounts
@@ -84,6 +84,7 @@ src/
   export.ts        GET /api/labels/export (§6)
   quarantine.ts    the quarantine flow: report, release, purge
   taxonomy.ts      GET /api/taxonomy/current
+  models.ts        the model registry: POST /api/models, GET /api/models/current
   reports.ts       POST /api/reports
   moderation.ts    attribution lookup and blocking, for the scripts below
   *.test.ts        tests (bun test), next to the code they cover
