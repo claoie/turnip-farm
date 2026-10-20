@@ -103,6 +103,8 @@ describe("createHandler routing", () => {
       ["GET", "/api/quarantine/abc/release"],
       ["GET", "/api/reports"],
       ["POST", "/api/reports/abc"],
+      ["GET", "/api/models"],
+      ["POST", "/api/models/current"],
     ] as const) {
       const res = await handle(request(method, path));
       expect(res.status).toBe(404);
@@ -118,6 +120,7 @@ describe("createHandler routing", () => {
       ["POST", "/api/quarantine", JSON.stringify({ source_ids: [vid], reason: "r" })],
       ["POST", `/api/quarantine/${vid}/release`, undefined],
       ["POST", `/api/quarantine/${vid}/purge`, undefined],
+      ["POST", "/api/models", JSON.stringify({ version: "x" })],
     ] as const) {
       const res = await handle(
         new Request(`http://farm.test${path}`, {
@@ -176,6 +179,51 @@ describe("createHandler routing", () => {
       expect(res.headers.get("Cache-Control")).toBe("max-age=3600");
     }
   });
+
+  test("GET /api/models/current reaches the models handler", async () => {
+    // A stub sql dispatching on the query text, like models.test.ts; the
+    // handler is public, so a session-bearing request must be served too,
+    // not tied to an account. The stub r2 signs the artifact URL.
+    const stubSql = (async (strings: TemplateStringsArray) => {
+      const q = String(strings[0]);
+      if (q.includes("FROM models")) {
+        return [
+          {
+            version: "trick-v1.2",
+            model_type: "trick-detection",
+            taxonomy_version: 1,
+            r2_key: "models/trick-v1.2.mlmodelc.zip",
+            sha256: "a".repeat(64),
+            byte_size: 10,
+            min_client_version: null,
+            input_desc: {},
+            output_desc: {},
+            holdout_report_r2_key: null,
+            training_run_id: null,
+            val_metrics: {},
+            name_metrics: {},
+            promoted_at: new Date("2026-10-06T06:00:00Z"),
+          },
+        ];
+      }
+      return [{ raw: "cork", canonical: "cork", taxonomy_version: 1 }];
+    }) as unknown as SQL;
+    const stubR2 = {
+      ...noR2,
+      presignGet: (key: string) => ({ url: `https://r2.test/${key}?sig=x`, expiresAt: new Date() }),
+    };
+    const handleHere = createHandler({ ...deps, sql: stubSql, r2: stubR2 });
+    const headerCases: Record<string, string>[] = [{}, { authorization: "Bearer <redacted>" }];
+    for (const headers of headerCases) {
+      const res = await handleHere(new Request("http://farm.test/api/models/current", { headers }));
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { version: string; url: string };
+      expect(body.version).toBe("trick-v1.2");
+      expect(body.url).toBe("https://r2.test/models/trick-v1.2.mlmodelc.zip?sig=x");
+      expect(res.headers.get("ETag")).toBe('"trick-v1.2"');
+      expect(res.headers.get("Cache-Control")).toBe("max-age=300");
+    }
+  });
 });
 
 describe("startServer", () => {
@@ -231,6 +279,30 @@ describe("startServer", () => {
       const url = new URL("/api/taxonomy/current", limited.url);
       // The first two pass the limiter and reach the handler (noDatabase
       // throws on the taxonomy query, so 500 — the point is "not 429").
+      expect((await fetch(url)).status).toBe(500);
+      expect((await fetch(url)).status).toBe(500);
+      const res = await fetch(url);
+      expect(res.status).toBe(429);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("RATE_LIMITED");
+      expect(res.headers.get("Retry-After")).not.toBeNull();
+    } finally {
+      limited.stop(true);
+    }
+  });
+
+  test("GET /api/models/current is per-IP rate limited", async () => {
+    const limited = startServer(0, {
+      ...deps,
+      limits: {
+        user: new TokenBucket(1000, 60000),
+        ip: new TokenBucket(1000, 60000),
+        publicIp: new TokenBucket(2, 1),
+      },
+    });
+    try {
+      const url = new URL("/api/models/current", limited.url);
+      // The first two pass the limiter and reach the handler (noDatabase
+      // throws on the models query, so 500 — the point is "not 429").
       expect((await fetch(url)).status).toBe(500);
       expect((await fetch(url)).status).toBe(500);
       const res = await fetch(url);

@@ -14,6 +14,7 @@ import {
 import { handlePostClipLabels, handlePostClips } from "./contrib/clips";
 import { handleGetLabelsExport } from "./export";
 import { handleGetTaxonomyCurrent } from "./taxonomy";
+import { handleGetModelsCurrent, handlePostModels } from "./models";
 import {
   handlePostQuarantine,
   handlePurgeQuarantine,
@@ -91,6 +92,12 @@ export function createHandler(deps: AppDeps): (req: Request) => Promise<Response
           return handleGetTaxonomyCurrent(req, deps);
         }
       }
+      if (seg[1] === "models") {
+        if (method === "POST" && seg.length === 2) return handlePostModels(req, deps);
+        if (method === "GET" && seg.length === 3 && seg[2] === "current") {
+          return handleGetModelsCurrent(req, deps);
+        }
+      }
       if (seg[1] === "quarantine") {
         if (method === "POST" && seg.length === 2) return handlePostQuarantine(req, deps);
         if (method === "POST" && seg.length === 4 && isVideoId(seg[2])) {
@@ -128,7 +135,10 @@ export function startServer(port: number, deps: AppDeps) {
       }
       // Per-IP limit on the public GET endpoints (§7.2); they are
       // cacheable, so legitimate clients rarely touch the bucket.
-      if (req.method === "GET" && pathname === "/api/taxonomy/current") {
+      if (
+        req.method === "GET" &&
+        (pathname === "/api/taxonomy/current" || pathname === "/api/models/current")
+      ) {
         const ip = server.requestIP(req)?.address ?? "unknown";
         if (!deps.limits.publicIp.take(ip)) {
           return errorResponse(429, "RATE_LIMITED", "Too many requests", {
