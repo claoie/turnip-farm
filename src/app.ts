@@ -19,13 +19,14 @@ import {
   handlePurgeQuarantine,
   handleReleaseQuarantine,
 } from "./quarantine";
+import { handlePostReport } from "./reports";
 import { errorResponse } from "./errors";
 import { isVideoId } from "./contrib/validate";
 import type { R2Client } from "./r2/client";
 import { TokenBucket } from "./ratelimit";
 
 export interface RateLimits {
-  /** Per-user token bucket for the contribution POSTs (§7.2). */
+  /** Per-user token bucket for the contribution POSTs and POST /api/reports (§7.2). */
   user: TokenBucket;
   /** Per-IP token bucket for POST /api/auth/apple and POST /api/auth/apple/notifications (§7.2). */
   ip: TokenBucket;
@@ -96,6 +97,9 @@ export function createHandler(deps: AppDeps): (req: Request) => Promise<Response
           if (seg[3] === "release") return handleReleaseQuarantine(req, deps, seg[2]!);
           if (seg[3] === "purge") return handlePurgeQuarantine(req, deps, seg[2]!);
         }
+      }
+      if (method === "POST" && seg.length === 2 && seg[1] === "reports") {
+        return handlePostReport(req, deps);
       }
     }
     return errorResponse(404, "NOT_FOUND", "Not found");

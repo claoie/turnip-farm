@@ -79,6 +79,7 @@ describe("createHandler routing", () => {
       ["DELETE", "/api/sources/abc"],
       ["POST", "/api/clips"],
       ["POST", "/api/clips/abc/labels"],
+      ["POST", "/api/reports"],
     ] as const) {
       const res = await handle(request(method, path));
       expect(res.status).toBe(401);
@@ -100,6 +101,8 @@ describe("createHandler routing", () => {
       ["GET", "/api/quarantine"],
       ["POST", "/api/taxonomy/current"],
       ["GET", "/api/quarantine/abc/release"],
+      ["GET", "/api/reports"],
+      ["POST", "/api/reports/abc"],
     ] as const) {
       const res = await handle(request(method, path));
       expect(res.status).toBe(404);

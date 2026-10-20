@@ -30,27 +30,64 @@ The design documents are the contract. Read them before changing behavior:
 
 ## Status
 
-Early. The service starts, validates its configuration, and serves
-`GET /healthz`. The Postgres schema (BACKEND_DESIGN.md §3) is in place as
-dbmate migrations. Sign in with Apple and farm sessions (§7.1) work:
-`POST /api/auth/apple` and `POST /api/auth/signout`. The contribution,
-model, and export endpoints are tracked as separate issues.
+Every BACKEND_DESIGN.md §7.3 endpoint is in place except the model
+registry (`POST /api/models` and `GET /api/models/current`, issue #10).
+The service validates its configuration and serves `GET /healthz`; the
+Postgres schema (§3) is in place as dbmate migrations.
+
+- **Accounts (§7.1):** Sign in with Apple and farm sessions
+  (`POST /api/auth/apple`, `POST /api/auth/signout`), account deletion
+  (`DELETE /api/account`), and Apple's server-to-server notifications
+  (`POST /api/auth/apple/notifications`).
+- **Contributions:** `POST /api/sources`, `GET /api/sources/:id`,
+  `GET /api/sources/:id/pose`, `DELETE /api/sources/:id`,
+  `POST /api/clips`, and `POST /api/clips/:id/labels`, with source-key
+  ownership (§7.2). An ingest worker polls R2 and turns each staged
+  upload into the canonical 10 Hz blob (§1.2.10).
+- **Training:** the vocabulary (`GET /api/taxonomy/current`), the
+  label export (`GET /api/labels/export`), and the quarantine flow
+  (`POST /api/quarantine` with its release and purge calls).
+- **Moderation:** `POST /api/reports`, and maintainer scripts to resolve
+  a source to its account within the attribution window and to block or
+  unblock an account (see [Moderation](#moderation)). Blocked accounts
+  get `403 ACCOUNT_BLOCKED` everywhere except sign-out and account
+  deletion (§1.2.16).
+- **Unlinking (§1.2.17):** a purge at startup and hourly deletes
+  attribution 30 days after a source's last write and reports 30 days
+  after they are filed.
 
 ## Layout
 
 ```
 src/
-  index.ts         entry point: loads config, starts the server
+  index.ts         entry point: loads config; starts the server, purge, and ingest poller
   app.ts           HTTP routing
   errors.ts        the API error shape (BACKEND_DESIGN.md §7.2)
+  ratelimit.ts     per-user and per-IP token buckets (§7.2)
   db.ts            transaction helper
-  auth/
-    apple.ts       Apple JWT verification, client secret, code exchange
-    sessions.ts    sign-in, sign-out, and session authentication (§7.1)
-    tokens.ts      session tokens and refresh-token encryption
-    testing.ts     stand-in Apple endpoints for tests
   config.ts        env-based configuration; fails fast on missing variables
+  auth/
+    apple.ts         Apple JWT verification, client secret, code exchange, revocation
+    sessions.ts      sign-in, sign-out, and session authentication (§7.1)
+    account.ts       DELETE /api/account
+    notifications.ts Apple server-to-server notifications
+    tokens.ts        session tokens and refresh-token encryption
+    testing.ts       stand-in Apple endpoints for tests
+  contrib/
+    sources.ts     source registration, read, pose download, delete
+    clips.ts       clip upserts and label-set replacement (§4, §5)
+    validate.ts    request validation shared by the contribution endpoints
+    purge.ts       the 30-day attribution and report purge (§1.2.17)
+  ingest/          staged upload → canonical TKP1 blob (POSE_FORMAT.md)
+  r2/              R2 client, presigned URLs, key conventions
+  pipeline.ts      service-key auth for the pipeline endpoints (§7.1)
+  export.ts        GET /api/labels/export (§6)
+  quarantine.ts    the quarantine flow: report, release, purge
+  taxonomy.ts      GET /api/taxonomy/current
+  reports.ts       POST /api/reports
+  moderation.ts    attribution lookup and blocking, for the scripts below
   *.test.ts        tests (bun test), next to the code they cover
+scripts/           maintainer scripts, run with bun run (see Moderation)
 db/
   migrations/      dbmate migrations, additive only (BACKEND_DESIGN.md §2)
   schema.test.ts   checks a migrated database against BACKEND_DESIGN.md §3
@@ -98,11 +135,31 @@ bun run db:migrate
 dbmate refuses a server without TLS unless the URL ends in
 `?sslmode=disable`, as the one in `.env.example` does.
 
-Tests that need a database (`db/schema.test.ts` and parts of
-`src/auth/sessions.test.ts`) run only when `TEST_DATABASE_URL` names a migrated
-database. They never read `DATABASE_URL`, and every test rolls its
-transaction back, so pointing them at the local database above is safe. CI
-sets it, and the tests fail rather than skip when it is missing there.
+Tests that need a database (`db/schema.test.ts` and most handler tests)
+run only when `TEST_DATABASE_URL` names a migrated database. They never
+read `DATABASE_URL`, and every test rolls its transaction back, so
+pointing them at the local database above is safe. CI sets it, and the
+tests fail rather than skip when it is missing there.
+
+### Moderation
+
+Two maintainer scripts work on the database at `DATABASE_URL`, for
+quarantine review (BACKEND_DESIGN.md §1.2.16, §1.2.17, master plan §6):
+
+```sh
+bun run moderation:source-account <source_id>   # the account that last wrote it
+bun run moderation:block <account_id>           # block the account
+bun run moderation:block --clear <account_id>   # unblock it
+```
+
+`moderation:source-account` answers only within the 30-day attribution
+window; past it the source belongs to no account. It prints the account
+ID without the source ID. Keep it that way wherever you copy it: an
+account ID must not sit next to a source ID in anything that outlives the
+window, such as alerts, issues, or notes (§8). Blocking stops new
+contributions at once and keeps the account's sessions, so it can still
+sign out and delete itself. To remove what the account already
+contributed, purge the quarantined sources.
 
 ### Configuration
 

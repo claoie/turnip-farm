@@ -13,7 +13,9 @@
     "db:migrate": "dbmate --no-dump-schema migrate",
     "db:rollback": "dbmate --no-dump-schema rollback",
     "db:status": "dbmate status",
-    "db:new": "dbmate new"
+    "db:new": "dbmate new",
+    "moderation:source-account": "bun scripts/source-account.ts",
+    "moderation:block": "bun scripts/block-account.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
