@@ -903,8 +903,8 @@ for `users.apple_refresh_token`).
   limited per client IP (suggested: 10 requests/minute), and so are
   the two public endpoints (suggested: 30 requests/minute; both are
   cacheable, see §7.3). The client IP is the socket peer's address, or
-  the first `X-Forwarded-For` entry when the peer is loopback (a reverse
-  proxy on the same host).
+  the last `X-Forwarded-For` entry when the peer is loopback (a reverse
+  proxy on the same host), with IPv6 limited per /64.
 
 ### 7.3 Endpoints
 

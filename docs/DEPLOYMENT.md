@@ -78,8 +78,8 @@ flowchart LR
   automatic certificates work with no extra setup. The cost is no
   Cloudflare DDoS shielding and a public origin address. Proxying can be
   turned on later (SSL mode *Full (strict)*, Caddy `trusted_proxies`
-  set to Cloudflare's ranges, and the farm's client-address rule
-  changed to match, §3 item 1).
+  set to Cloudflare's ranges, and a farm change so per-IP rate limits
+  look past Cloudflare's hop, §3 item 1).
 - **Cloudflare R2** holds pose blobs and model artifacts, never video
   (master plan §1). A second, private bucket holds encrypted database
   backups (§7.3); the farm process never sees it.
@@ -119,11 +119,12 @@ API). Items fixed since are marked.
    on the socket peer, which behind Caddy on loopback is `127.0.0.1` for
    every request, so the whole user base would have shared one bucket.
    When the peer is loopback, the farm now takes the client address from
-   the first `X-Forwarded-For` entry (`clientAddress` in
-   `src/ratelimit.ts`). That relies on Caddy's default of discarding
-   client-supplied `X-Forwarded-For` values: configuring
-   `trusted_proxies`, or proxying through Cloudflare (§2), makes the
-   first entry client-controlled, so change that rule first.
+   the last `X-Forwarded-For` entry, the one Caddy appended, which a
+   client can't forge (`clientAddress` in `src/ratelimit.ts`); IPv6
+   clients are limited per /64. Behind Cloudflare proxying (§2), with or
+   without `trusted_proxies`, that entry is Cloudflare's edge, so every
+   client behind one edge would share a bucket until the farm learns to
+   skip that hop.
 2. **The farm listens on every interface.** `Bun.serve` is started with
    a port and no hostname, so port 3000 is reachable from the internet
    unless a firewall stops it. §4.2 denies it in two places. An optional
@@ -398,8 +399,8 @@ documentation; Ubuntu's own package lags). Then:
 
 farm.example.com {
 	encode zstd gzip
-	# The farm keys per-IP rate limits on the X-Forwarded-For this sets.
-	# Don't add trusted_proxies without changing that first (§3 item 1).
+	# The farm keys per-IP rate limits on the last X-Forwarded-For
+	# entry, the client address this proxy saw (§3 item 1).
 	reverse_proxy 127.0.0.1:3000
 
 	# Access log to stderr, so journald holds it (§7.1). Caddy redacts

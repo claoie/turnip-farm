@@ -52,36 +52,56 @@ describe("clientAddress", () => {
   });
 
   test("takes the client from X-Forwarded-For when the peer is IPv6 loopback", () => {
-    expect(clientAddress("::1", "2001:db8::7")).toBe("2001:db8::7");
+    expect(clientAddress("::1", "203.0.113.7")).toBe("203.0.113.7");
+    expect(clientAddress("0:0:0:0:0:0:0:1", "203.0.113.7")).toBe("203.0.113.7");
   });
 
   test("takes the client from X-Forwarded-For when the peer is IPv4-mapped loopback", () => {
+    // What Bun's default dual-stack socket reports when Caddy dials 127.0.0.1.
     expect(clientAddress("::ffff:127.0.0.1", "203.0.113.7")).toBe("203.0.113.7");
     expect(clientAddress("::FFFF:127.0.0.1", "203.0.113.7")).toBe("203.0.113.7");
+    expect(clientAddress("::ffff:7f00:1", "203.0.113.7")).toBe("203.0.113.7");
   });
 
   test("falls back to the loopback peer when X-Forwarded-For is missing or empty", () => {
     expect(clientAddress("127.0.0.1", null)).toBe("127.0.0.1");
-    expect(clientAddress("::1", null)).toBe("::1");
-    expect(clientAddress("::ffff:127.0.0.1", null)).toBe("::ffff:127.0.0.1");
+    expect(clientAddress("::ffff:127.0.0.1", null)).toBe("127.0.0.1");
     expect(clientAddress("127.0.0.1", "")).toBe("127.0.0.1");
     expect(clientAddress("127.0.0.1", "  ")).toBe("127.0.0.1");
-    expect(clientAddress("127.0.0.1", " , 203.0.113.7")).toBe("127.0.0.1");
+    expect(clientAddress("127.0.0.1", "203.0.113.7, ")).toBe("127.0.0.1");
   });
 
-  test("uses the first of several X-Forwarded-For entries, trimmed", () => {
-    expect(clientAddress("127.0.0.1", " 203.0.113.7 , 198.51.100.2, 10.0.0.1")).toBe("203.0.113.7");
+  test("falls back to the loopback peer when the entry isn't an IP address", () => {
+    expect(clientAddress("127.0.0.1", "unknown")).toBe("127.0.0.1");
+    expect(clientAddress("127.0.0.1", "203.0.113.7:443")).toBe("127.0.0.1");
+    expect(clientAddress("127.0.0.1", "[2001:db8::7]")).toBe("127.0.0.1");
+    expect(clientAddress("127.0.0.1", "x".repeat(10_000))).toBe("127.0.0.1");
+  });
+
+  test("uses the last of several X-Forwarded-For entries, the one the proxy appended", () => {
+    expect(clientAddress("127.0.0.1", "198.51.100.66, 10.0.0.1 , 203.0.113.7 ")).toBe("203.0.113.7");
   });
 
   test("ignores X-Forwarded-For from a peer that isn't loopback", () => {
     expect(clientAddress("198.51.100.2", "203.0.113.7")).toBe("198.51.100.2");
-    expect(clientAddress("2001:db8::2", "127.0.0.1")).toBe("2001:db8::2");
+    expect(clientAddress("2001:db8::2", "203.0.113.7")).toBe("2001:db8:0:0::/64");
     // An IPv4-mapped address is loopback only when it maps 127.x.
-    expect(clientAddress("::ffff:198.51.100.2", "203.0.113.7")).toBe("::ffff:198.51.100.2");
+    expect(clientAddress("::ffff:198.51.100.2", "203.0.113.7")).toBe("198.51.100.2");
   });
 
-  test("keys on the peer as before when there is no header", () => {
-    expect(clientAddress("198.51.100.2", null)).toBe("198.51.100.2");
+  test("keys IPv6 clients on their /64 prefix", () => {
+    const a = clientAddress("2001:db8:1:2::7", null);
+    expect(a).toBe("2001:db8:1:2::/64");
+    expect(clientAddress("2001:0db8:0001:0002:ffff:ffff:ffff:ffff", null)).toBe(a);
+    expect(clientAddress("2001:db8:1:3::7", null)).not.toBe(a);
+    // The same through the proxy.
+    expect(clientAddress("127.0.0.1", "2001:db8:1:2::8")).toBe(a);
+    expect(clientAddress("2001:db8::1%en0", null)).toBe("2001:db8:0:0::/64");
+  });
+
+  test("keys IPv4-mapped clients on their IPv4 address", () => {
+    expect(clientAddress("::ffff:198.51.100.2", null)).toBe("198.51.100.2");
+    expect(clientAddress("127.0.0.1", "::ffff:203.0.113.7")).toBe("203.0.113.7");
   });
 
   test("is \"unknown\" when there is no peer address", () => {

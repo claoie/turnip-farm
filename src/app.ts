@@ -118,6 +118,8 @@ export function startServer(port: number, deps: AppDeps) {
   return Bun.serve({
     port,
     fetch(req, server) {
+      const clientIp = () =>
+        clientAddress(server.requestIP(req)?.address, req.headers.get("x-forwarded-for"));
       // Per-IP limit on sign-in and notification attempts (§7.2); there is
       // no user yet on either. The only legitimate notification sender is
       // Apple, but the URL is public and the bucket caps its abuse.
@@ -126,7 +128,7 @@ export function startServer(port: number, deps: AppDeps) {
         req.method === "POST" &&
         (pathname === "/api/auth/apple" || pathname === "/api/auth/apple/notifications")
       ) {
-        const ip = clientAddress(server.requestIP(req)?.address, req.headers.get("x-forwarded-for"));
+        const ip = clientIp();
         if (!deps.limits.ip.take(ip)) {
           return errorResponse(429, "RATE_LIMITED", "Too many requests", {
             headers: { "Retry-After": String(deps.limits.ip.retryAfterSec(ip)) },
@@ -139,7 +141,7 @@ export function startServer(port: number, deps: AppDeps) {
         req.method === "GET" &&
         (pathname === "/api/taxonomy/current" || pathname === "/api/models/current")
       ) {
-        const ip = clientAddress(server.requestIP(req)?.address, req.headers.get("x-forwarded-for"));
+        const ip = clientIp();
         if (!deps.limits.publicIp.take(ip)) {
           return errorResponse(429, "RATE_LIMITED", "Too many requests", {
             headers: { "Retry-After": String(deps.limits.publicIp.retryAfterSec(ip)) },
