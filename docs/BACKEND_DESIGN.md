@@ -902,9 +902,19 @@ for `users.apple_refresh_token`).
   `Retry-After`). `POST /api/auth/apple` has no user yet, so it is
   limited per client IP (suggested: 10 requests/minute), and so are
   the two public endpoints (suggested: 30 requests/minute; both are
-  cacheable, see §7.3). The client IP is the socket peer's address, or
-  the last `X-Forwarded-For` entry when the peer is loopback (a reverse
-  proxy on the same host), with IPv6 limited per /64.
+  cacheable, see §7.3). The client IP is the socket peer's address,
+  with IPv6 limited per /64, unless the peer is a trusted proxy:
+  loopback (a reverse proxy on the same host), or an address in the
+  optional `TRUSTED_PROXIES` setting, a comma-separated list of
+  addresses and CIDR ranges (a container network's subnet, a CDN's
+  ranges). From a trusted peer, the client is read from
+  `X-Forwarded-For`, last entry first: the first address that is not
+  itself a trusted proxy. Each proxy appends the address it saw, so a
+  client can add entries only to the left of the ones trusted proxies
+  appended, and the walk never reaches them. A missing or malformed
+  entry ends the walk at the last trusted address. Trusting a range
+  trusts everything that can connect from it, so it must hold only
+  proxies.
 
 ### 7.3 Endpoints
 
