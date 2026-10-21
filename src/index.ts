@@ -68,6 +68,7 @@ const server = startServer(config.port, {
     user: new TokenBucket(60, 60),
     ip: new TokenBucket(10, 10),
     publicIp: new TokenBucket(30, 30),
+    trustedProxies: config.trustedProxies,
   },
 });
 console.log(`turnip-farm listening on ${server.url}`);

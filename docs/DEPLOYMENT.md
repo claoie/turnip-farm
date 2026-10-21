@@ -77,9 +77,9 @@ flowchart LR
   by a third party, Caddy sees real client addresses, and Caddy's
   automatic certificates work with no extra setup. The cost is no
   Cloudflare DDoS shielding and a public origin address. Proxying can be
-  turned on later (SSL mode *Full (strict)*, Caddy `trusted_proxies`
-  set to Cloudflare's ranges, and a farm change so per-IP rate limits
-  look past Cloudflare's hop, §3 item 1).
+  turned on later (SSL mode *Full (strict)*, and Cloudflare's ranges in
+  both Caddy's `trusted_proxies` and the farm's `TRUSTED_PROXIES`, §3
+  item 1).
 - **Cloudflare R2** holds pose blobs and model artifacts, never video
   (master plan §1). A second, private bucket holds encrypted database
   backups (§7.3); the farm process never sees it.
@@ -121,10 +121,13 @@ API). Items fixed since are marked.
    When the peer is loopback, the farm now takes the client address from
    the last `X-Forwarded-For` entry, the one Caddy appended, which a
    client can't forge (`clientAddress` in `src/ratelimit.ts`); IPv6
-   clients are limited per /64. Behind Cloudflare proxying (§2), with or
-   without `trusted_proxies`, that entry is Cloudflare's edge, so every
-   client behind one edge would share a bucket until the farm learns to
-   skip that hop.
+   clients are limited per /64. Behind Cloudflare proxying (§2) that
+   entry is Cloudflare's edge, so every client behind one edge would
+   share a bucket. Listing Cloudflare's ranges in Caddy's
+   `trusted_proxies`, so Caddy keeps the entry Cloudflare added, and in
+   the farm's `TRUSTED_PROXIES`, so the farm skips the edge
+   (`BACKEND_DESIGN.md` §7.2), keys each client on its own address
+   again.
 2. **The farm listens on every interface.** `Bun.serve` is started with
    a port and no hostname, so port 3000 is reachable from the internet
    unless a firewall stops it. §4.2 denies it in two places. An optional
@@ -273,10 +276,10 @@ Never put a `.env` file in a release directory: Bun and dbmate both load
 
 ### 4.6 Configuration
 
-Every variable the farm reads, plus one it must never see. `PORT` and
-`INGEST_POLL_INTERVAL_MS` are optional; with any other missing or
-invalid, the farm exits with status 1 and lists every problem at once
-(`src/config.ts`).
+Every variable the farm reads, plus one it must never see. `PORT`,
+`TRUSTED_PROXIES` and `INGEST_POLL_INTERVAL_MS` are optional; with any
+other missing or invalid, the farm exits with status 1 and lists every
+problem at once (`src/config.ts`).
 
 | Variable                  | Value in production                                                   |
 | ------------------------- | --------------------------------------------------------------------- |
@@ -293,6 +296,7 @@ invalid, the farm exits with status 1 and lists every problem at once
 | `APPLE_REFRESH_TOKEN_KEY` | `openssl rand -base64 32`, generated once (§9 Q6)                     |
 | `TURNIP_PIPELINE_KEY`     | `openssl rand -hex 32` (§9 Q1)                                        |
 | `INGEST_POLL_INTERVAL_MS` | Optional. Default 30000; `0` disables the poller (§6)                 |
+| `TRUSTED_PROXIES`         | Optional. Unset behind Caddy; Cloudflare's ranges if proxied (§2)     |
 | `TEST_DATABASE_URL`       | **Never set in production.** Test-only; the farm does not read it.   |
 
 Write each value in single quotes:

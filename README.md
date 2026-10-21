@@ -186,6 +186,7 @@ exits with status 1 and lists every problem at once.
 | `APPLE_PRIVATE_KEY`       | yes      | That key's `.p8` PEM; on one line, newlines as `\n`           |
 | `APPLE_REFRESH_TOKEN_KEY` | yes      | 32 random bytes, base64: encrypts stored Apple refresh tokens |
 | `TURNIP_PIPELINE_KEY`     | yes      | Service key for the training pipeline's endpoints             |
+| `TRUSTED_PROXIES`         | no       | Trusted proxy addresses and CIDRs, comma-separated (§7.2)     |
 
 ## Contributing
 

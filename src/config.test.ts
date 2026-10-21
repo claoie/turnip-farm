@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ConfigError, DEFAULT_PORT, REQUIRED_ENV, loadConfig } from "./config";
+import { parseProxyRange } from "./ratelimit";
 
 const PEM_LINES = ["-----BEGIN PRIVATE KEY-----", "MIGTAgEAMBMGByqGSM49AgEGCCqGSM49", "-----END PRIVATE KEY-----"];
 const REFRESH_KEY_BYTES = new Uint8Array(32).fill(7);
@@ -48,6 +49,7 @@ describe("loadConfig", () => {
         refreshTokenKey: REFRESH_KEY_BYTES,
       },
       pipelineKey: "pipeline-key",
+      trustedProxies: [],
     });
   });
 
@@ -94,6 +96,21 @@ describe("loadConfig", () => {
   ])("rejects an APPLE_REFRESH_TOKEN_KEY that is %s", (_, key) => {
     expect(problemsFor({ ...FULL_ENV, APPLE_REFRESH_TOKEN_KEY: key })).toEqual([
       "APPLE_REFRESH_TOKEN_KEY must be 32 random bytes, base64-encoded",
+    ]);
+  });
+
+  test("reads TRUSTED_PROXIES, skipping blank entries", () => {
+    expect(loadConfig({ ...FULL_ENV, TRUSTED_PROXIES: " 172.16.0.0/12, fd00::/8, " }).trustedProxies).toEqual([
+      parseProxyRange("172.16.0.0/12")!,
+      parseProxyRange("fd00::/8")!,
+    ]);
+    expect(loadConfig({ ...FULL_ENV, TRUSTED_PROXIES: " " }).trustedProxies).toEqual([]);
+  });
+
+  test("rejects each TRUSTED_PROXIES entry that isn't an address or range", () => {
+    expect(problemsFor({ ...FULL_ENV, TRUSTED_PROXIES: "172.16.0.0/12, docker, 10.0.0.0/33" })).toEqual([
+      'TRUSTED_PROXIES entry "docker" is not an IP address or CIDR range',
+      'TRUSTED_PROXIES entry "10.0.0.0/33" is not an IP address or CIDR range',
     ]);
   });
 

@@ -8,27 +8,81 @@
 import { isIPv4, isIPv6 } from "node:net";
 
 /**
- * The client address a per-IP bucket is keyed on. Behind a reverse proxy
- * on the same host (docs/DEPLOYMENT.md §4.9) the socket peer is loopback
- * for every request, so the client comes from the last X-Forwarded-For
- * entry instead: the address the proxy itself saw and appended, which a
- * client can't forge. (Caddy discards client-supplied values by default,
- * so it is usually the only entry. Behind a proxying CDN it is the CDN's
- * edge, and clients behind one edge share a bucket.) From any other peer,
- * or when that entry isn't an IP address, the header is ignored.
+ * The client address a per-IP bucket is keyed on (BACKEND_DESIGN.md §7.2).
+ * Behind a reverse proxy the socket peer is the proxy, so when the peer is
+ * trusted (loopback, or inside one of `trusted`) the client comes from
+ * X-Forwarded-For instead. Each proxy appends the address it saw, so the
+ * entries are read from the last one back, skipping trusted proxies; the
+ * first other address is the client. Whatever a client sends itself sits
+ * to the left of that, out of reach. A missing or malformed entry stops the
+ * walk at the last trusted address. From any other peer the header is
+ * ignored.
  *
  * IPv4-mapped IPv6 addresses count as their IPv4 address, and other IPv6
  * addresses as their /64 prefix: one host commonly holds a whole /64 and
  * could otherwise take a fresh bucket per address.
  */
-export function clientAddress(peer: string | undefined, forwardedFor: string | null): string {
+export function clientAddress(
+  peer: string | undefined,
+  forwardedFor: string | null,
+  trusted: readonly ProxyRange[] = [],
+): string {
   const p = peer === undefined ? null : parseIp(peer);
   if (p === null) return peer ?? "unknown";
-  if (forwardedFor !== null && isLoopback(p)) {
-    const forwarded = parseIp(forwardedFor.split(",").at(-1)!.trim());
-    if (forwarded !== null) return bucketKey(forwarded);
+  let client = p;
+  if (forwardedFor !== null) {
+    const entries = forwardedFor.split(",");
+    for (let i = entries.length - 1; i >= 0 && isTrusted(client, trusted); i--) {
+      const hop = parseIp(entries[i]!.trim());
+      if (hop === null) break;
+      client = hop;
+    }
   }
-  return bucketKey(p);
+  return bucketKey(client);
+}
+
+/** An address or CIDR range from TRUSTED_PROXIES. */
+export interface ProxyRange {
+  v6: boolean;
+  bytes: number[];
+  prefix: number;
+}
+
+/**
+ * Parses one TRUSTED_PROXIES entry: an IPv4 or IPv6 address, optionally
+ * with a /prefix. Null when it is neither. An IPv4-mapped IPv6 address
+ * counts as IPv4, as everywhere else here.
+ */
+export function parseProxyRange(text: string): ProxyRange | null {
+  const [addr, prefixText, ...rest] = text.trim().split("/");
+  if (rest.length > 0) return null;
+  const ip = parseIp(addr!);
+  if (ip === null) return null;
+  const v6 = "v6" in ip;
+  const max = v6 ? 128 : 32;
+  if (prefixText !== undefined && !/^\d{1,3}$/.test(prefixText)) return null;
+  const prefix = prefixText === undefined ? max : Number(prefixText);
+  if (prefix > max) return null;
+  return { v6, bytes: ipBytes(ip), prefix };
+}
+
+function isTrusted(ip: Ip, trusted: readonly ProxyRange[]): boolean {
+  return isLoopback(ip) || trusted.some((r) => inRange(ip, r));
+}
+
+function inRange(ip: Ip, r: ProxyRange): boolean {
+  if (("v6" in ip) !== r.v6) return false;
+  const b = ipBytes(ip);
+  for (let i = 0, bits = r.prefix; bits > 0; i++, bits -= 8) {
+    const mask = bits >= 8 ? 0xff : (0xff << (8 - bits)) & 0xff;
+    if ((b[i]! & mask) !== (r.bytes[i]! & mask)) return false;
+  }
+  return true;
+}
+
+function ipBytes(ip: Ip): number[] {
+  if ("v4" in ip) return ip.v4.split(".").map(Number);
+  return ip.v6.flatMap((g) => [g >> 8, g & 0xff]);
 }
 
 type Ip = { v4: string } | { v6: number[] };

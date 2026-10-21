@@ -2,7 +2,7 @@ import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { type AppDeps, createHandler, startServer } from "./app";
 import { noDatabase } from "./auth/testing";
 import type { R2Client } from "./r2/client";
-import { TokenBucket } from "./ratelimit";
+import { TokenBucket, parseProxyRange } from "./ratelimit";
 import type { SQL } from "bun";
 
 const noR2: R2Client = {
@@ -360,6 +360,36 @@ describe("startServer", () => {
       expect((await post("203.0.113.7")).status).toBe(500);
       expect((await post("203.0.113.7")).status).toBe(500);
       expect((await post("203.0.113.7")).status).toBe(429);
+      expect((await post("198.51.100.2")).status).toBe(500);
+    } finally {
+      limited.stop(true);
+    }
+  });
+
+  test("behind a chain of trusted proxies, the sign-in bucket keys on the client past them", async () => {
+    // As if a container proxy at 10.0.0.1 forwarded to a loopback hop.
+    const limited = startServer(0, {
+      ...deps,
+      limits: {
+        user: new TokenBucket(1000, 60000),
+        ip: new TokenBucket(2, 1),
+        publicIp: new TokenBucket(1000, 60000),
+        trustedProxies: [parseProxyRange("10.0.0.0/8")!],
+      },
+    });
+    try {
+      const url = `http://127.0.0.1:${limited.port}/api/auth/apple/notifications`;
+      const post = (client: string) =>
+        fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Forwarded-For": `${client}, 10.0.0.1` },
+          body: JSON.stringify({ payload: "x" }),
+        });
+      // 500 means the request passed the limiter (the verifier rejects).
+      expect((await post("203.0.113.7")).status).toBe(500);
+      expect((await post("203.0.113.7")).status).toBe(500);
+      expect((await post("203.0.113.7")).status).toBe(429);
+      // Untrusted, 10.0.0.1 would be the client and this would share the bucket.
       expect((await post("198.51.100.2")).status).toBe(500);
     } finally {
       limited.stop(true);

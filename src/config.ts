@@ -2,6 +2,8 @@
 // problems are reported together, so a misconfigured deploy fails fast with
 // one actionable message instead of crashing on first use.
 
+import { type ProxyRange, parseProxyRange } from "./ratelimit";
+
 export interface Config {
   port: number;
   databaseUrl: string;
@@ -24,6 +26,9 @@ export interface Config {
   };
   // Service key for the pipeline endpoints (BACKEND_DESIGN.md §7.1).
   pipelineKey: string;
+  // Proxies, besides loopback, whose X-Forwarded-For per-IP rate limits
+  // read through (BACKEND_DESIGN.md §7.2). Empty when unset.
+  trustedProxies: ProxyRange[];
 }
 
 export const REQUIRED_ENV = [
@@ -80,6 +85,17 @@ export function loadConfig(env: Env): Config {
     problems.push("APPLE_REFRESH_TOKEN_KEY must be 32 random bytes, base64-encoded");
   }
 
+  const trustedProxies: ProxyRange[] = [];
+  for (const entry of (env.TRUSTED_PROXIES ?? "").split(",")) {
+    if (entry.trim() === "") continue;
+    const range = parseProxyRange(entry);
+    if (range === null) {
+      problems.push(`TRUSTED_PROXIES entry "${entry.trim()}" is not an IP address or CIDR range`);
+    } else {
+      trustedProxies.push(range);
+    }
+  }
+
   if (problems.length > 0 || port === null || privateKeyPem === undefined || refreshTokenKey === null) {
     throw new ConfigError(problems);
   }
@@ -101,6 +117,7 @@ export function loadConfig(env: Env): Config {
       refreshTokenKey,
     },
     pipelineKey: required.TURNIP_PIPELINE_KEY,
+    trustedProxies,
   };
 }
 

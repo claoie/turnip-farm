@@ -24,7 +24,7 @@ import { handlePostReport } from "./reports";
 import { errorResponse } from "./errors";
 import { isVideoId } from "./contrib/validate";
 import type { R2Client } from "./r2/client";
-import { TokenBucket, clientAddress } from "./ratelimit";
+import { type ProxyRange, TokenBucket, clientAddress } from "./ratelimit";
 
 export interface RateLimits {
   /** Per-user token bucket for the contribution POSTs and POST /api/reports (§7.2). */
@@ -33,6 +33,8 @@ export interface RateLimits {
   ip: TokenBucket;
   /** Per-IP token bucket for the public GET endpoints (§7.2). */
   publicIp: TokenBucket;
+  /** Proxies, besides loopback, whose X-Forwarded-For the per-IP buckets read through (§7.2). */
+  trustedProxies?: readonly ProxyRange[];
 }
 
 import { type RevokeRefreshToken, type VerifyAppleJwt } from "./auth/apple";
@@ -119,7 +121,11 @@ export function startServer(port: number, deps: AppDeps) {
     port,
     fetch(req, server) {
       const clientIp = () =>
-        clientAddress(server.requestIP(req)?.address, req.headers.get("x-forwarded-for"));
+        clientAddress(
+          server.requestIP(req)?.address,
+          req.headers.get("x-forwarded-for"),
+          deps.limits.trustedProxies,
+        );
       // Per-IP limit on sign-in and notification attempts (§7.2); there is
       // no user yet on either. The only legitimate notification sender is
       // Apple, but the URL is public and the bucket caps its abuse.
