@@ -16,7 +16,9 @@ import { isIPv4, isIPv6 } from "node:net";
  * first other address is the client. Whatever a client sends itself sits
  * to the left of that, out of reach. A missing or malformed entry stops the
  * walk at the last trusted address. From any other peer the header is
- * ignored.
+ * ignored. A loopback entry is skipped like any trusted proxy: a proxy
+ * appends it only for a host-local request, and a host-local process can
+ * already set its own address by connecting to the farm directly.
  *
  * IPv4-mapped IPv6 addresses count as their IPv4 address, and other IPv6
  * addresses as their /64 prefix: one host commonly holds a whole /64 and

@@ -142,6 +142,11 @@ describe("clientAddress with trusted proxies", () => {
     expect(clientAddress("172.18.0.2", null, trusted)).toBe("172.18.0.2");
   });
 
+  test("skips a loopback entry like any trusted proxy", () => {
+    // nginx → Caddy on one host: Caddy appends nginx's loopback address.
+    expect(clientAddress("127.0.0.1", "203.0.113.7, 127.0.0.1")).toBe("203.0.113.7");
+  });
+
   test("ends at the first entry when every hop is trusted", () => {
     expect(clientAddress("127.0.0.1", "172.18.0.5", docker)).toBe("172.18.0.5");
     expect(clientAddress("172.18.0.2", "127.0.0.1, 172.18.0.5", docker)).toBe("127.0.0.1");
