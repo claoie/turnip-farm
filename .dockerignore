@@ -1,0 +1,10 @@
+# Ignore dot files: .env and its variants, .git, .github, .claude
+.*
+
+# Ignore build outputs and dependencies; the builder installs and builds
+dist
+node_modules
+
+# Not needed to build or run
+docs
+*.md

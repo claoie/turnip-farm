@@ -98,7 +98,9 @@ db/
   schema.test.ts   checks a migrated database against BACKEND_DESIGN.md §3
   testing.ts       helpers for tests that need a database
 docs/              design documents (see above)
-.github/workflows/ CI: install, migrate, re-run newest migration, typecheck, test, build
+Dockerfile         the production image (see Deployment)
+.github/workflows/ CI: install, migrate, re-run newest migration, typecheck, test, build;
+                   CD: publish the image and deploy it once CI passes on main
 ```
 
 ## Development
@@ -186,6 +188,28 @@ exits with status 1 and lists every problem at once.
 | `APPLE_PRIVATE_KEY`       | yes      | That key's `.p8` PEM; on one line, newlines as `\n`           |
 | `APPLE_REFRESH_TOKEN_KEY` | yes      | 32 random bytes, base64: encrypts stored Apple refresh tokens |
 | `TURNIP_PIPELINE_KEY`     | yes      | Service key for the training pipeline's endpoints             |
+
+## Deployment
+
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) is the production runbook. The
+farm also ships as a Docker image, built from the `Dockerfile`:
+
+- On start it applies pending migrations with dbmate, waiting for a
+  database that is still starting, then runs the bundle. Migrations are
+  additive and re-runnable (BACKEND_DESIGN.md §2), so every restart is
+  safe.
+- Configuration is the environment in [Configuration](#configuration);
+  the image holds no `.env`. The healthcheck (`GET /healthz`) follows
+  `PORT`.
+- It runs as the unprivileged `bun` user, without `node_modules`. The
+  maintainer scripts run from source inside it:
+  `docker exec <container> bun run moderation:block <account_id>`.
+
+The CD workflow runs once CI passes on a push to `main`. It pushes
+`turnip-farm:latest` and `turnip-farm:sha-<short sha>` to Docker Hub, then
+calls the host's deploy hook. It needs four repository secrets:
+`DOCKER_HUB_USERNAME`, `DOCKER_HUB_ACCESS_TOKEN`, `DEPLOY_URL` and
+`DEPLOY_SECRET`.
 
 ## Contributing
 

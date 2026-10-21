@@ -87,6 +87,16 @@ flowchart LR
   `turnip-ml`'s decision; it needs the pipeline key (§9 Q1) and an R2
   token (§9 Q4), and reaches the farm over HTTPS like any client.
 
+**Container variant.** On a host that already runs its services under
+Docker Compose behind a containerized reverse proxy, the farm runs from
+its Docker image instead (README, *Deployment*). The image and the host's
+compose file then replace §4.4, §4.5, §4.7–4.9 and §5: the image applies
+migrations on every start, compose supervises it, and the CD workflow
+publishes and deploys every `main` commit whose CI passed. Cloudflare
+(§4.1), the Postgres role and database (§4.3), the configuration (§4.6),
+the smoke test and Apple registration (§4.10), retention (§7) and the ops
+decisions (§9) still apply, and so does §3 item 7.
+
 ### 2.1 Budget
 
 | Item                                   | Monthly, approx.                 |
@@ -146,6 +156,14 @@ API). Items fixed since are marked.
    from the README's table and `.env.example`, and an invalid value
    silently falls back to 30000 instead of failing fast like every other
    variable.
+7. **Per-IP rate limits behind a containerized proxy.** Item 1's fix
+   trusts `X-Forwarded-For` only from a loopback peer. A reverse proxy in
+   its own container (the container variant, §2) reaches the farm from a
+   bridge-network address, so the farm ignores the header and every
+   client shares one bucket: 10 sign-ins and 30 public GETs a minute for
+   the whole user base. The fix is a setting for trusted proxy ranges,
+   which changes `BACKEND_DESIGN.md` §7.2 first; the Cloudflare case in
+   item 1 needs the same setting.
 
 ## 4. Provisioning
 
