@@ -159,14 +159,16 @@ API). Items fixed since are marked.
    from the README's table and `.env.example`, and an invalid value
    silently falls back to 30000 instead of failing fast like every other
    variable.
-7. **Per-IP rate limits behind a containerized proxy.** Item 1's fix
-   trusts `X-Forwarded-For` only from a loopback peer. A reverse proxy in
-   its own container (the container variant, §2) reaches the farm from a
-   bridge-network address, so the farm ignores the header and every
-   client shares one bucket: 10 sign-ins and 30 public GETs a minute for
-   the whole user base. The fix is a setting for trusted proxy ranges,
-   which changes `BACKEND_DESIGN.md` §7.2 first; the Cloudflare case in
-   item 1 needs the same setting.
+7. **Per-IP rate limits behind a containerized proxy (fixed).** Item 1's
+   fix trusted `X-Forwarded-For` only from a loopback peer, and a reverse
+   proxy in its own container (the container variant, §2) reaches the
+   farm from a bridge-network address, so every client would have shared
+   one bucket. Set `TRUSTED_PROXIES` to the container network's subnet
+   (`BACKEND_DESIGN.md` §7.2). That subnet includes its gateway, from
+   which Docker's userland proxy relays the connections it handles
+   itself (host loopback, and external IPv6 on a host with IPv6), so
+   publish the farm's port on host loopback only and let the proxy reach
+   it over the container network.
 
 ## 4. Provisioning
 
