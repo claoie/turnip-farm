@@ -505,10 +505,14 @@ older ones.
 farm. Do not roll the schema back: migrations are additive, so the
 previous release runs against the newer schema.
 
-A restart drops in-flight requests (the farm has no graceful-shutdown
-handler). Every client write is idempotent (`BACKEND_DESIGN.md` §4) and
-the app retries, uploads keep landing in R2 while the farm is down, and
-ingest catches up on the first poll after the restart.
+On a restart the farm shuts down gracefully: on the SIGTERM that
+`systemctl restart` and `docker stop` send, it stops accepting
+connections, lets in-flight requests finish and exits (`src/index.ts`).
+A request still running when the supervisor's grace period ends (90 s
+for systemd, 10 s for Docker, by default) is cut off. Every client write
+is idempotent (`BACKEND_DESIGN.md` §4) and the app retries, uploads keep
+landing in R2 while the farm is down, and ingest catches up on the first
+poll after the restart.
 
 ## 6. Ingest trigger: poller or R2 event notifications
 

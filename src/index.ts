@@ -76,13 +76,30 @@ console.log(`turnip-farm listening on ${server.url}`);
 // sweep the staging prefix on an interval. Optional env override;
 // 0 disables (e.g. when R2 event notifications drive ingest instead).
 const ingestIntervalMs = parseIngestIntervalMs(process.env.INGEST_POLL_INTERVAL_MS);
+let stopIngest: (() => void) | undefined;
 if (ingestIntervalMs > 0) {
-  startIngestPoller(
+  stopIngest = startIngestPoller(
     { store: new R2BlobStore(config.r2), sources: createPostgresSourceStore(sql) },
     ingestIntervalMs,
   );
   console.log(`ingest poller running every ${ingestIntervalMs}ms`);
 }
+
+// Graceful shutdown on SIGTERM, which `docker stop` and `systemctl restart`
+// send: stop accepting connections, let in-flight requests finish, then
+// close the database pool. Without a handler, Bun as a container's PID 1
+// ignores SIGTERM and is killed mid-request when the grace period ends.
+let stopping = false;
+process.on("SIGTERM", async () => {
+  if (stopping) return;
+  stopping = true;
+  console.log("turnip-farm shutting down");
+  clearInterval(purgeTimer);
+  stopIngest?.();
+  await server.stop();
+  await sql.end();
+  process.exit(0);
+});
 
 function parseIngestIntervalMs(raw: string | undefined): number {
   if (raw === undefined || raw.trim() === "") return 30_000;

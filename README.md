@@ -64,7 +64,8 @@ in place as dbmate migrations.
 
 ```
 src/
-  index.ts         entry point: loads config; starts the server, purge, and ingest poller
+  index.ts         entry point: loads config; starts the server, purge, and ingest poller;
+                   shuts them down gracefully on SIGTERM
   app.ts           HTTP routing
   errors.ts        the API error shape (BACKEND_DESIGN.md §7.2)
   ratelimit.ts     per-user and per-IP token buckets, and the client address they key on (§7.2)
@@ -99,8 +100,9 @@ db/
   testing.ts       helpers for tests that need a database
 docs/              design documents (see above)
 Dockerfile         the production image (see Deployment)
-.github/workflows/ CI: install, migrate, re-run newest migration, typecheck, test, build;
-                   CD: publish the image and deploy it once CI passes on main
+.github/workflows/ CI: install, migrate, re-run newest migration, typecheck, test, build,
+                   and build the image; CD: publish the image and deploy it once CI
+                   passes on main
 ```
 
 ## Development
