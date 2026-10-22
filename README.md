@@ -208,9 +208,12 @@ farm also ships as a Docker image, built from the `Dockerfile`:
   maintainer scripts run from source inside it:
   `docker exec <container> bun run moderation:block <account_id>`.
 
-The CD workflow runs once CI passes on a push to `main`. It pushes
+The CD workflow runs once CI passes on a push to `main`. It builds
+`main`'s tip, and only once CI has passed for that commit, so CI runs that
+finish out of order never deploy an older commit. It pushes
 `turnip-farm:latest` and `turnip-farm:sha-<short sha>` to Docker Hub, then
-calls the host's deploy hook. It needs four repository secrets:
+calls the host's deploy hook. Runs queue rather than cancel each other. It
+needs four repository secrets:
 `DOCKER_HUB_USERNAME`, `DOCKER_HUB_ACCESS_TOKEN`, `DEPLOY_URL` and
 `DEPLOY_SECRET`.
 
