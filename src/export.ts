@@ -24,15 +24,21 @@ export interface ExportDeps extends PipelineDeps {
 export const EXPORT_PAGE_LIMIT = 10000;
 
 interface Cursor {
-  rowCursor: string; // ISO-8601, the GREATEST(updated_at) triple's head
+  rowCursor: string; // ISO-8601 UTC with microseconds, the GREATEST(updated_at) triple's head
   clipId: string;
   trickName: string;
 }
 
-/** Opaque cursor: base64url of the JSON triple. The pipeline treats it as opaque. */
-export function encodeCursor(rowCursor: Date, clipId: string, trickName: string): string {
+/**
+ * Opaque cursor: base64url of the JSON triple. The pipeline treats it as opaque.
+ * rowCursor is row_cursor_iso, formatted by Postgres at full microsecond
+ * precision: updated_at comes from now(), and a JS Date (milliseconds) would
+ * truncate it, so the keyset predicate would match the page's last row again.
+ * Cursors encoded before that (".sssZ") still decode and still cast.
+ */
+export function encodeCursor(rowCursor: string, clipId: string, trickName: string): string {
   return Buffer.from(
-    JSON.stringify([rowCursor.toISOString(), clipId, trickName]),
+    JSON.stringify([rowCursor, clipId, trickName]),
     "utf8",
   ).toString("base64url");
 }
@@ -80,7 +86,9 @@ async function selectRows(
              l.trick_name,
              l.origin,
              l.taxonomy_version,
-             GREATEST(s.updated_at, c.updated_at, l.updated_at) AS row_cursor
+             GREATEST(s.updated_at, c.updated_at, l.updated_at) AS row_cursor,
+             to_char(GREATEST(s.updated_at, c.updated_at, l.updated_at) AT TIME ZONE 'UTC',
+                     'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS row_cursor_iso
       FROM sources s
       JOIN clips  c ON c.source_id = s.id
       JOIN labels l ON l.clip_id   = c.id
@@ -106,7 +114,9 @@ async function selectRows(
            l.trick_name,
            l.origin,
            l.taxonomy_version,
-           GREATEST(s.updated_at, c.updated_at, l.updated_at) AS row_cursor
+           GREATEST(s.updated_at, c.updated_at, l.updated_at) AS row_cursor,
+           to_char(GREATEST(s.updated_at, c.updated_at, l.updated_at) AT TIME ZONE 'UTC',
+                   'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS row_cursor_iso
     FROM sources s
     JOIN clips  c ON c.source_id = s.id
     JOIN labels l ON l.clip_id   = c.id
@@ -165,6 +175,6 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
     // Non-null whenever rows is non-empty; null only on an empty page —
     // the pipeline gets an exact watermark for the cost of one extra
     // empty request per pull (maintainer decision 2026-10-14 on #19).
-    next_cursor: last ? encodeCursor(last.row_cursor as Date, last.clip_id, last.trick_name) : null,
+    next_cursor: last ? encodeCursor(last.row_cursor_iso as string, last.clip_id, last.trick_name) : null,
   });
 }

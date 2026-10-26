@@ -205,6 +205,75 @@ describeDb("GET /api/labels/export", () => {
     });
   });
 
+  test("paginates sub-millisecond row_cursors with no gaps or dupes", async () => {
+    // updated_at is TIMESTAMPTZ DEFAULT now(), so real rows carry
+    // microseconds; a JS Date keeps only milliseconds. Seeds here differ
+    // within one millisecond and tie exactly, and every page limit from
+    // one row per page to the whole export in one page must return each
+    // row once, in cursor order, with next_cursor advancing every page.
+    // The source and clips sit at TS, so each row's cursor is its label's.
+    const labelsAt: [number, string, string][] = [
+      [0, "cork", "2026-10-15T12:00:00.123456Z"],
+      [0, "gainer", "2026-10-15T12:00:00.123456Z"], // exact tie
+      [1, "cork", "2026-10-15T12:00:00.123457Z"], // 1µs later, same ms
+      [1, "gainer", "2026-10-15T12:00:00.123999Z"],
+      [2, "cork", "2026-10-15T12:00:00.124001Z"],
+      [2, "gainer", "2026-10-15T12:00:00.999999Z"],
+    ];
+    const expectKeys = labelsAt.map(([c, name]) => `${clipId(50 + c)}|${name}`);
+
+    for (let limit = 1; limit <= labelsAt.length + 1; limit++) {
+      await inRollback(sharedSql!, async (tx) => {
+        const v = vid("9");
+        await seedSource(tx, v);
+        for (const c of [0, 1, 2]) await seedClip(tx, clipId(50 + c), v);
+        for (const [c, name, at] of labelsAt) await seedLabel(tx, clipId(50 + c), name, { updatedAt: at });
+
+        const d = deps(tx, limit);
+        const keys: string[] = [];
+        const cursors = new Set<string>();
+        let since: string | null = null;
+        for (let i = 0; i < 20; i++) {
+          const res = await handleGetLabelsExport(
+            get(`/api/labels/export${since ? `?since=${since}` : ""}`, authHeaders),
+            d,
+          );
+          expect(res.status).toBe(200);
+          const body = await bodyJson(res);
+          keys.push(...body.rows.map((r: any) => `${r.clip_id}|${r.trick_name}`));
+          if (body.rows.length === 0) {
+            // The terminal page: re-querying with the final cursor is empty.
+            expect(since).not.toBeNull();
+            expect(body.next_cursor).toBeNull();
+            break;
+          }
+          expect(typeof body.next_cursor).toBe("string");
+          expect(cursors.has(body.next_cursor)).toBe(false);
+          cursors.add(body.next_cursor);
+          since = body.next_cursor;
+        }
+        expect(keys).toEqual(expectKeys);
+        expect(cursors.size).toBe(Math.ceil(labelsAt.length / limit));
+      });
+    }
+  });
+
+  test("a millisecond cursor from before the microsecond fix still pages", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const v = vid("8");
+      await seedSource(tx, v);
+      await seedClip(tx, clipId(60), v);
+      await seedLabel(tx, clipId(60), "cork");
+      await seedLabel(tx, clipId(60), "gainer");
+      // Encoded the old way, Date.toISOString(): three fractional digits.
+      const since = Buffer.from(JSON.stringify([TS, clipId(60), "cork"]), "utf8").toString("base64url");
+      const res = await handleGetLabelsExport(get(`/api/labels/export?since=${since}`, authHeaders), deps(tx));
+      expect(res.status).toBe(200);
+      const body = await bodyJson(res);
+      expect(body.rows.map((r: any) => r.trick_name)).toEqual(["gainer"]);
+    });
+  });
+
   test("quarantined sources are excluded; released sources rejoin", async () => {
     await inRollback(sharedSql!, async (tx) => {
       const v = vid("e");

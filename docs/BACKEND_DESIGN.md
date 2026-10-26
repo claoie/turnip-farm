@@ -725,7 +725,11 @@ Notes:
   as `since`. It is non-null whenever `rows` is non-empty and null only
   on an empty page, so the pipeline gets an exact watermark for the cost
   of one extra empty request per pull (maintainer decision 2026-10-14
-  on #19).
+  on #19). It carries `row_cursor` at full microsecond precision,
+  formatted by Postgres (`to_char(... AT TIME ZONE 'UTC', ...US"Z")`):
+  `now()` stores microseconds, and a millisecond cursor would make the
+  `>` predicate match the page's last row again, so the cursor would
+  never advance.
 - `blob_sha256` is never null in export rows: the query filters
   `s.sha256 IS NOT NULL` explicitly. Label submission already requires
   an ingested blob (`BLOB_MISSING`), so this only states it; the
