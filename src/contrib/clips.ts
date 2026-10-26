@@ -20,7 +20,17 @@ import {
   type R2Client,
 } from "../r2/client";
 import type { RateLimits } from "../app";
-import { dedupeLabelNames, isSourceKey, isUuid, isVideoId, readJsonObject } from "./validate";
+import {
+  isSourceKey,
+  isUuid,
+  isVideoId,
+  type Label,
+  provenanceProblem,
+  type Provenance,
+  readJsonObject,
+  readLabels,
+  readProvenance,
+} from "./validate";
 
 export interface ClipsDeps {
   sql: SQL;
@@ -41,14 +51,14 @@ function rateLimit(deps: ClipsDeps, userId: string): Response | null {
 const invalid = (message: string, details: Record<string, unknown> = {}) =>
   errorResponse(422, "VALIDATION_ERROR", message, { details });
 
-interface ClipInput {
+interface ClipInput extends Provenance {
   clip_id: string;
   source_id: string;
   source_key: string;
   start_frame: number;
   end_frame: number;
   auto_detected: boolean;
-  labels: string[];
+  labels: Label[];
 }
 
 function readClipInput(
@@ -69,7 +79,13 @@ function readClipInput(
     return fail("end_frame", "must be an integer > start_frame");
   }
   if (typeof c.auto_detected !== "boolean") return fail("auto_detected", "must be a boolean");
-  if (c.labels !== undefined && !Array.isArray(c.labels)) return fail("labels", "must be an array of strings");
+  // `labels` is optional per clip and may be [] (clears the set).
+  const labels = c.labels === undefined ? { labels: [] } : readLabels(c.labels);
+  if ("error" in labels) return fail(`labels${labels.path}`, labels.error);
+  const provenance = readProvenance(c);
+  if ("error" in provenance) return fail(provenance.field, provenance.error);
+  const problem = provenanceProblem(provenance.provenance, labels.labels);
+  if (problem) return fail(problem.field, problem.error);
   return {
     clip: {
       clip_id: c.clip_id as string,
@@ -78,7 +94,8 @@ function readClipInput(
       start_frame: c.start_frame as number,
       end_frame: c.end_frame as number,
       auto_detected: c.auto_detected as boolean,
-      labels: dedupeLabelNames(c.labels),
+      ...provenance.provenance,
+      labels: labels.labels,
     },
   };
 }
@@ -90,12 +107,14 @@ function sha256HexBytes(bytes: Uint8Array): string {
 async function replaceLabelSet(
   tx: SQL,
   clipId: string,
-  names: string[],
+  labels: Label[],
   taxonomyVersion: number,
 ): Promise<void> {
   await tx`DELETE FROM labels WHERE clip_id = ${clipId}`;
-  for (const name of names) {
-    await tx`INSERT INTO labels (clip_id, trick_name, taxonomy_version) VALUES (${clipId}, ${name}, ${taxonomyVersion})`;
+  for (const { name, origin } of labels) {
+    await tx`
+      INSERT INTO labels (clip_id, trick_name, origin, taxonomy_version)
+      VALUES (${clipId}, ${name}, ${origin}, ${taxonomyVersion})`;
   }
 }
 
@@ -206,15 +225,27 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
     const [tax] = await tx`SELECT max(taxonomy_version) AS v FROM label_taxonomy`;
     const taxonomyVersion = tax.v as number;
     for (const clip of inputs) {
+      // Bun binds a JS array as its comma-joined string, which Postgres can't read as
+      // TEXT[]; JSON carries the names intact, commas included. Bound as text and cast by
+      // Postgres: a parameter cast straight to jsonb, Bun JSON-encodes a second time.
+      const suggestedNames = JSON.stringify(clip.suggested_names);
       await tx`
-        INSERT INTO clips (id, source_id, start_frame, end_frame, auto_detected, updated_at)
-        VALUES (${clip.clip_id}, ${clip.source_id}, ${clip.start_frame}, ${clip.end_frame}, ${clip.auto_detected}, now())
+        INSERT INTO clips
+          (id, source_id, start_frame, end_frame, auto_detected,
+           proposal_model_version, suggested_names, suggestions_withheld, updated_at)
+        VALUES (${clip.clip_id}, ${clip.source_id}, ${clip.start_frame}, ${clip.end_frame}, ${clip.auto_detected},
+                ${clip.proposal_model_version},
+                ARRAY(SELECT jsonb_array_elements_text(${suggestedNames}::text::jsonb)),
+                ${clip.suggestions_withheld}, now())
         ON CONFLICT (id) DO UPDATE SET
-          source_id     = EXCLUDED.source_id,
-          start_frame   = EXCLUDED.start_frame,
-          end_frame     = EXCLUDED.end_frame,
-          auto_detected = EXCLUDED.auto_detected,
-          updated_at    = now()`;
+          source_id              = EXCLUDED.source_id,
+          start_frame            = EXCLUDED.start_frame,
+          end_frame              = EXCLUDED.end_frame,
+          auto_detected          = EXCLUDED.auto_detected,
+          proposal_model_version = EXCLUDED.proposal_model_version,
+          suggested_names        = EXCLUDED.suggested_names,
+          suggestions_withheld   = EXCLUDED.suggestions_withheld,
+          updated_at             = now()`;
       await replaceLabelSet(tx, clip.clip_id, clip.labels, taxonomyVersion);
     }
 
@@ -246,21 +277,27 @@ export async function handlePostClipLabels(
 
   const body = await readJsonObject(req);
   if (!isSourceKey(body?.source_key)) return invalid("source_key must be 43-char base64url");
-  const names = dedupeLabelNames(body?.labels);
+  const read = body!.labels === undefined ? { labels: [] } : readLabels(body!.labels);
+  if ("error" in read) return invalid(`labels${read.path}: ${read.error}`, { field: `labels${read.path}` });
+  const labels = read.labels;
 
   const out = await transaction(deps.sql, async (tx) => {
     const [clip] = await tx`
-      SELECT c.id, c.source_id FROM clips c
+      SELECT c.id, c.source_id, c.proposal_model_version, c.suggested_names, c.suggestions_withheld FROM clips c
       JOIN sources s ON s.id = c.source_id
       WHERE c.id = ${clipId} AND s.source_key_hash = ${sha256Hex(body!.source_key as string)}`;
     if (!clip) return { status: 404 as const };
+    // The labels answer to the provenance the clip was contributed with (§7.3).
+    const problem = provenanceProblem(clip as unknown as Provenance, labels);
+    if (problem) return { status: 422 as const, problem };
     const [tax] = await tx`SELECT max(taxonomy_version) AS v FROM label_taxonomy`;
     const taxonomyVersion = tax.v as number;
-    await replaceLabelSet(tx, clipId, names, taxonomyVersion);
+    await replaceLabelSet(tx, clipId, labels, taxonomyVersion);
     await recordAttribution(tx, clip.source_id as string, auth.userId);
-    return { status: 200 as const, clip_id: clipId, labels: names, taxonomy_version: taxonomyVersion };
+    return { status: 200 as const, clip_id: clipId, labels, taxonomy_version: taxonomyVersion };
   });
 
   if (out.status === 404) return notFound();
+  if (out.status === 422) return invalid(`${out.problem.field}: ${out.problem.error}`, { field: out.problem.field });
   return Response.json({ clip_id: out.clip_id, labels: out.labels, taxonomy_version: out.taxonomy_version });
 }

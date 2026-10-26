@@ -123,7 +123,10 @@ interface ClipRow {
   start_frame: number;
   end_frame: number;
   auto_detected: boolean;
-  labels: { trick_name: string; taxonomy_version: number; created_at: string }[];
+  proposal_model_version: string | null;
+  suggested_names: string[];
+  suggestions_withheld: boolean;
+  labels: { name: string; origin: string; taxonomy_version: number; created_at: string }[];
 }
 
 // GET /api/sources/:id — source with confirmed clips + labels (§7.3).
@@ -146,11 +149,12 @@ export async function handleGetSource(
 
   const rows = await deps.sql`
     SELECT c.id, c.start_frame, c.end_frame, c.auto_detected, c.created_at,
-           l.trick_name, l.taxonomy_version, l.created_at AS label_created_at
+           c.proposal_model_version, c.suggested_names, c.suggestions_withheld,
+           l.trick_name, l.origin, l.taxonomy_version, l.created_at AS label_created_at
     FROM clips c
     LEFT JOIN labels l ON l.clip_id = c.id
     WHERE c.source_id = ${sourceId}
-    ORDER BY c.created_at, l.created_at`;
+    ORDER BY c.created_at, c.id, l.created_at, lower(l.trick_name)`;
   const clips = new Map<string, ClipRow>();
   for (const r of rows as Record<string, unknown>[]) {
     let clip = clips.get(r.id as string);
@@ -160,13 +164,17 @@ export async function handleGetSource(
         start_frame: r.start_frame as number,
         end_frame: r.end_frame as number,
         auto_detected: r.auto_detected as boolean,
+        proposal_model_version: r.proposal_model_version as string | null,
+        suggested_names: r.suggested_names as string[],
+        suggestions_withheld: r.suggestions_withheld as boolean,
         labels: [],
       };
       clips.set(clip.id, clip);
     }
     if (r.trick_name !== null) {
       clip.labels.push({
-        trick_name: r.trick_name as string,
+        name: r.trick_name as string,
+        origin: r.origin as string,
         taxonomy_version: r.taxonomy_version as number,
         created_at: (r.label_created_at as Date).toISOString(),
       });

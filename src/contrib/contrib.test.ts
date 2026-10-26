@@ -223,7 +223,12 @@ describeDb("POST /api/clips", () => {
         start_frame: 120,
         end_frame: 175,
         auto_detected: false,
-        labels: [" cork ", "CORK", "gainer", ""],
+        labels: [
+          { name: " cork ", origin: "typed" },
+          { name: "CORK", origin: "vocabulary" },
+          { name: "gainer", origin: "vocabulary" },
+          { name: "", origin: "typed" },
+        ],
         ...overrides,
       },
     ],
@@ -242,21 +247,89 @@ describeDb("POST /api/clips", () => {
       const body = await bodyJson(res);
       expect(body.clips).toHaveLength(1);
       expect(body.clips[0].clip_id).toBe(CLIP_ID);
-      expect(body.clips[0].labels).toEqual(["CORK", "gainer"]);
+      expect(body.clips[0].labels).toEqual([
+        { name: "CORK", origin: "vocabulary" },
+        { name: "gainer", origin: "vocabulary" },
+      ]);
       expect(body.clips[0].taxonomy_version).toBe(1);
 
-      const labels = await tx`SELECT trick_name FROM labels WHERE clip_id = ${CLIP_ID} ORDER BY trick_name`;
-      expect(labels.map((l: Record<string, unknown>) => l.trick_name)).toEqual(["CORK", "gainer"]);
+      const labels = await tx`SELECT trick_name, origin FROM labels WHERE clip_id = ${CLIP_ID} ORDER BY trick_name`;
+      expect(labels.map((l: Record<string, unknown>) => [l.trick_name, l.origin])).toEqual([
+        ["CORK", "vocabulary"],
+        ["gainer", "vocabulary"],
+      ]);
 
       // Re-submit replaces the set.
       const res2 = await handlePostClips(
-        post("/api/clips", clipBody({ clip_id: CLIP_ID, labels: ["hook"] }), authed(token)),
+        post("/api/clips", clipBody({ clip_id: CLIP_ID, labels: [{ name: "hook", origin: "typed" }] }), authed(token)),
         d,
       );
       expect(res2.status).toBe(200);
-      expect((await bodyJson(res2)).clips[0].labels).toEqual(["hook"]);
-      const labels2 = await tx`SELECT trick_name FROM labels WHERE clip_id = ${CLIP_ID}`;
-      expect(labels2.map((l: Record<string, unknown>) => l.trick_name)).toEqual(["hook"]);
+      expect((await bodyJson(res2)).clips[0].labels).toEqual([{ name: "hook", origin: "typed" }]);
+      const labels2 = await tx`SELECT trick_name, origin FROM labels WHERE clip_id = ${CLIP_ID}`;
+      expect(labels2.map((l: Record<string, unknown>) => [l.trick_name, l.origin])).toEqual([["hook", "typed"]]);
+    });
+  });
+
+  test("200: a model-proposed clip keeps its provenance, replaced on re-submit", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      const blob = new TextEncoder().encode("canonical-bytes");
+      const d = deps(tx, fakeR2({ bytes: blob }));
+      await seedIngestedSource(tx, token, createHash("sha256").update(blob).digest("hex"));
+
+      const proposed = clipBody({
+        auto_detected: true,
+        proposal_model_version: "trick-v1.3",
+        suggested_names: ["cork", "gainer"],
+        labels: [
+          { name: "cork", origin: "model" },
+          { name: "hook", origin: "typed" },
+        ],
+      });
+      expect((await handlePostClips(post("/api/clips", proposed, authed(token)), d)).status).toBe(200);
+      const [clip] = await tx`
+        SELECT proposal_model_version, suggested_names, suggestions_withheld FROM clips WHERE id = ${CLIP_ID}`;
+      expect(clip.proposal_model_version).toBe("trick-v1.3");
+      expect(clip.suggested_names).toEqual(["cork", "gainer"]);
+      expect(clip.suggestions_withheld).toBe(false);
+
+      // The client's current record is the truth (§4): a manual re-trim drops the model.
+      const manual = clipBody({ labels: [{ name: "hook", origin: "typed" }] });
+      expect((await handlePostClips(post("/api/clips", manual, authed(token)), d)).status).toBe(200);
+      const [after] = await tx`
+        SELECT proposal_model_version, suggested_names FROM clips WHERE id = ${CLIP_ID}`;
+      expect(after.proposal_model_version).toBeNull();
+      expect(after.suggested_names).toEqual([]);
+    });
+  });
+
+  test("422 rather than dropping labels it can't read, or provenance that contradicts itself", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      const blob = new TextEncoder().encode("canonical-bytes");
+      const d = deps(tx, fakeR2({ bytes: blob }));
+      await seedIngestedSource(tx, token, createHash("sha256").update(blob).digest("hex"));
+
+      const cases: Record<string, unknown>[] = [
+        { labels: ["cork"] },
+        { labels: [{ name: "cork" }] },
+        { labels: [{ name: "cork", origin: "guessed" }] },
+        { labels: [{ name: "cork", origin: "model" }] },
+        { suggested_names: ["cork"] },
+        { suggestions_withheld: true },
+        {
+          proposal_model_version: "trick-v1.3",
+          suggestions_withheld: true,
+          labels: [{ name: "cork", origin: "model" }],
+        },
+      ];
+      for (const overrides of cases) {
+        const res = await handlePostClips(post("/api/clips", clipBody(overrides), authed(token)), d);
+        await expectError(res, 422, "VALIDATION_ERROR");
+      }
+      expect(await tx`SELECT id FROM clips`).toHaveLength(0);
+      expect(await tx`SELECT id FROM labels`).toHaveLength(0);
     });
   });
 
@@ -364,20 +437,45 @@ describeDb("POST /api/clips/:id/labels", () => {
       await tx`UPDATE sources SET sha256 = ${hex} WHERE id = ${VIDEO_ID}`;
       await tx`INSERT INTO clips (id, source_id, start_frame, end_frame) VALUES (${CLIP_ID}, ${VIDEO_ID}, 1, 2)`;
 
+      const labels = [
+        { name: "hook", origin: "vocabulary" },
+        { name: "Hook", origin: "typed" },
+        { name: "", origin: "typed" },
+      ];
       const res = await handlePostClipLabels(
-        post(`/api/clips/${CLIP_ID}/labels`, { source_key: SOURCE_KEY, labels: ["hook", "Hook", ""] }, authed(token)),
+        post(`/api/clips/${CLIP_ID}/labels`, { source_key: SOURCE_KEY, labels }, authed(token)),
         d,
         CLIP_ID,
       );
       expect(res.status).toBe(200);
       expect(await bodyJson(res)).toEqual({
         clip_id: CLIP_ID,
-        labels: ["Hook"],
+        labels: [{ name: "Hook", origin: "typed" }],
         taxonomy_version: 1,
       });
+      const [stored] = await tx`SELECT trick_name, origin FROM labels WHERE clip_id = ${CLIP_ID}`;
+      expect([stored.trick_name, stored.origin]).toEqual(["Hook", "typed"]);
+
+      // Labels answer to the clip's stored provenance: this one has no proposing model.
+      const kept = { source_key: SOURCE_KEY, labels: [{ name: "cork", origin: "model" }] };
+      await expectError(
+        await handlePostClipLabels(post(`/api/clips/${CLIP_ID}/labels`, kept, authed(token)), d, CLIP_ID),
+        422,
+        "VALIDATION_ERROR",
+      );
+      const strings = { source_key: SOURCE_KEY, labels: ["cork"] };
+      await expectError(
+        await handlePostClipLabels(post(`/api/clips/${CLIP_ID}/labels`, strings, authed(token)), d, CLIP_ID),
+        422,
+        "VALIDATION_ERROR",
+      );
 
       const bad = await handlePostClipLabels(
-        post(`/api/clips/${CLIP_ID}/labels`, { source_key: OTHER_KEY, labels: ["x"] }, authed(token)),
+        post(
+          `/api/clips/${CLIP_ID}/labels`,
+          { source_key: OTHER_KEY, labels: [{ name: "x", origin: "typed" }] },
+          authed(token),
+        ),
         d,
         CLIP_ID,
       );
@@ -397,9 +495,9 @@ describeDb("GET /api/sources/:id", () => {
       const d = deps(tx, fakeR2());
       const reg = await registerSource(tx, d, token);
       expect(reg.status).toBe(201);
-      await tx`INSERT INTO clips (id, source_id, start_frame, end_frame, auto_detected)
-        VALUES (${CLIP_ID}, ${VIDEO_ID}, 120, 175, false)`;
-      await tx`INSERT INTO labels (clip_id, trick_name, taxonomy_version) VALUES (${CLIP_ID}, 'cork', 1)`;
+      await tx`INSERT INTO clips (id, source_id, start_frame, end_frame, auto_detected, proposal_model_version, suggested_names)
+        VALUES (${CLIP_ID}, ${VIDEO_ID}, 120, 175, true, 'trick-v1.3', ARRAY['cork'])`;
+      await tx`INSERT INTO labels (clip_id, trick_name, origin, taxonomy_version) VALUES (${CLIP_ID}, 'cork', 'model', 1)`;
 
       const key = { "source-key": SOURCE_KEY };
       const res = await handleGetSource(get(`/api/sources/${VIDEO_ID}`, authed(token, key)), d, VIDEO_ID);
@@ -409,8 +507,18 @@ describeDb("GET /api/sources/:id", () => {
       expect(body.source.frame_count).toBe(600);
       expect(body.source).not.toHaveProperty("source_key_hash");
       expect(body.clips).toHaveLength(1);
+      expect(body.clips[0]).toMatchObject({
+        id: CLIP_ID,
+        start_frame: 120,
+        end_frame: 175,
+        auto_detected: true,
+        proposal_model_version: "trick-v1.3",
+        suggested_names: ["cork"],
+        suggestions_withheld: false,
+      });
       expect(body.clips[0].labels).toHaveLength(1);
-      expect(body.clips[0].labels[0].trick_name).toBe("cork");
+      expect(body.clips[0].labels[0]).toMatchObject({ name: "cork", origin: "model", taxonomy_version: 1 });
+      expect(body.clips[0].labels[0]).not.toHaveProperty("trick_name");
 
       await expectError(
         await handleGetSource(get(`/api/sources/${VIDEO_ID}`, authed(token)), d, VIDEO_ID),
