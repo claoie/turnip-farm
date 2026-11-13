@@ -4,6 +4,7 @@ import { startServer } from "./app";
 import { createAppleJwtVerifier, createAppleRevoker, createAppleTokenVerifier, createCodeExchanger, importApplePrivateKey } from "./auth/apple";
 import { importRefreshTokenKey } from "./auth/tokens";
 import { type Config, ConfigError, loadConfig } from "./config";
+import { deleteIdleAccounts } from "./auth/account";
 import { purgeExpiredAttribution } from "./contrib/purge";
 import { R2BlobStore } from "./ingest/store";
 import { createPostgresSourceStore, startIngestPoller } from "./ingest/worker";
@@ -44,14 +45,25 @@ const appleCredentials = {
   privateKey,
 };
 
-// 30-day attribution/report purge (§1.2.17, §4): at startup and hourly.
-// Failures are logged, never fatal: a late purge never extends the link
-// because every attribution read also filters the 30-day window.
-const purge = () =>
-  purgeExpiredAttribution(sql).catch((err) => console.error("attribution purge failed:", err));
-await purge();
-const purgeTimer = setInterval(purge, 60 * 60 * 1000);
-purgeTimer.unref?.();
+const r2 = createR2Client(config.r2);
+const refreshTokenKey = await importRefreshTokenKey(config.apple.refreshTokenKey);
+const revokeRefreshToken = createAppleRevoker({ credentials: appleCredentials });
+
+// Retention jobs (§1.2.17, §4), at startup and hourly: the report purge
+// (and the 30-day attribution purge for accounts that only agreed to the
+// 30-day disclosure), then the 24-month idle-account deletion. Failures are
+// logged, never fatal; the next run retries.
+const retention = async () => {
+  await purgeExpiredAttribution(sql).catch((err) => console.error("retention purge failed:", err));
+  await deleteIdleAccounts({ sql, r2, refreshTokenKey, revokeRefreshToken })
+    .then(({ deleted, failed }) => {
+      if (deleted > 0 || failed > 0) console.log(`idle accounts: ${deleted} deleted, ${failed} failed`);
+    })
+    .catch((err) => console.error("idle-account deletion failed:", err));
+};
+await retention();
+const retentionTimer = setInterval(retention, 60 * 60 * 1000);
+retentionTimer.unref?.();
 
 // The built web client lives next to the server bundle (build/client).
 // Run from source there is no build, so the API runs without file serving
@@ -67,10 +79,11 @@ const server = startServer(config.port, {
   exchangeCode: createCodeExchanger({ credentials: appleCredentials }),
   // Server-to-server notifications carry no `exp` (§7.1).
   verifyNotificationPayload: createAppleJwtVerifier({ audience: config.appBundleId, requireExp: false }),
-  revokeRefreshToken: createAppleRevoker({ credentials: appleCredentials }),
-  refreshTokenKey: await importRefreshTokenKey(config.apple.refreshTokenKey),
-  r2: createR2Client(config.r2),
+  revokeRefreshToken,
+  refreshTokenKey,
+  r2,
   pipelineKey: config.pipelineKey,
+  currentDisclosureVersion: config.currentDisclosureVersion,
   limits: {
     // §7.2 suggestions: 60/min per user on POSTs, 10/min per IP on sign-in
     // and notifications, 30/min per IP on the public GET endpoints.
@@ -104,7 +117,7 @@ process.on("SIGTERM", async () => {
   if (stopping) return;
   stopping = true;
   console.log("turnip-farm shutting down");
-  clearInterval(purgeTimer);
+  clearInterval(retentionTimer);
   stopIngest?.();
   await server.stop();
   await sql.end();

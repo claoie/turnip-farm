@@ -49,6 +49,7 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       ORDER BY table_name`;
     expect(rows.map((r: { table_name: string }) => r.table_name)).toEqual([
       "clips",
+      "consents",
       "data_quarantine",
       "label_taxonomy",
       "labels",
@@ -71,6 +72,7 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
     expect(rows.map((r: { indexdef: string }) => r.indexdef)).toEqual([
       "CREATE UNIQUE INDEX clips_pkey ON public.clips USING btree (id)",
       "CREATE INDEX clips_source_id_idx ON public.clips USING btree (source_id)",
+      "CREATE UNIQUE INDEX consents_pkey ON public.consents USING btree (user_id, disclosure_version)",
       "CREATE INDEX data_quarantine_open_idx ON public.data_quarantine USING btree (quarantined_at) WHERE (resolved_at IS NULL)",
       "CREATE UNIQUE INDEX data_quarantine_open_uniq ON public.data_quarantine USING btree (source_id) WHERE (resolved_at IS NULL)",
       "CREATE UNIQUE INDEX data_quarantine_pkey ON public.data_quarantine USING btree (id)",
@@ -92,6 +94,7 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       "CREATE UNIQUE INDEX source_attribution_pkey ON public.source_attribution USING btree (source_id)",
       "CREATE INDEX source_attribution_user_id_idx ON public.source_attribution USING btree (user_id)",
       "CREATE UNIQUE INDEX sources_pkey ON public.sources USING btree (id)",
+      "CREATE INDEX users_last_active_at_idx ON public.users USING btree (last_active_at)",
       "CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id)",
     ]);
   });

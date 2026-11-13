@@ -33,6 +33,7 @@ const deps: AppDeps = {
   refreshTokenKey: {} as CryptoKey,
   r2: noR2,
   pipelineKey: "test-pipeline-key",
+  currentDisclosureVersion: 3,
   limits: {
     user: new TokenBucket(1000, 60000),
     ip: new TokenBucket(1000, 60000),
@@ -76,6 +77,7 @@ describe("createHandler routing", () => {
     // noDatabase throws if a handler reaches the database; 401 proves the
     // route dispatched to a session-guarded handler.
     for (const [method, path] of [
+      ["POST", "/api/consent"],
       ["POST", "/api/sources"],
       ["GET", "/api/sources/abc"],
       ["GET", "/api/sources/abc/pose"],
@@ -92,6 +94,7 @@ describe("createHandler routing", () => {
 
   test("wrong-method contribution routes are 404", async () => {
     for (const [method, path] of [
+      ["GET", "/api/consent"],
       ["GET", "/api/sources"],
       ["PUT", "/api/sources/abc"],
       ["GET", "/api/clips"],

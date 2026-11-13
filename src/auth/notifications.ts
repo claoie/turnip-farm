@@ -59,8 +59,6 @@ export async function handleAppleNotifications(req: Request, deps: Notifications
     case "account-deleted": {
       // The user deleted their Apple Account and can never sign in again
       // to delete their data: run `DELETE /api/account` steps 2 and 3.
-      // Sources past the attribution window are not linked to the account
-      // and stay.
       try {
         await deleteAccountData(deps.sql, deps.r2, event.sub);
       } catch {

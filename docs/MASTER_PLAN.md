@@ -18,7 +18,9 @@ carry provenance and a blind sample guards against rubber-stamped model
 suggestions, the vocabulary is served apart from the model, the
 manifest and source reads carry impact feedback, validation leakage
 becomes a measured risk, and Rev 4's unlinking is kept with recorded
-reopen triggers.*
+reopen triggers. Rev 6 (2026-11, the privacy plan) reverses the 30-day
+unlink: the account link lasts until the account is deleted, by the
+user or after 24 months idle, and consent is recorded on the farm.*
 
 This document is the master plan for `turnip-farm` (backend + dataset) and
 `turnip-ml` (training), and the contract they hold with `turnip-ios`.
@@ -145,10 +147,11 @@ clip shows the user or someone else.
   it.
 - Account subject — the Sign in with Apple `sub` claim, which is already
   per-app opaque. Needed for sign-in, rate limiting, and blocking. It is
-  linked to a contribution only for quarantine attribution (§6), and
-  only until 30 days after the contribution's last write; after that
-  the contribution has no account link. Ownership of a contribution is
-  a per-source key the client holds, not the account.
+  linked to a contribution through `source_attribution` for quarantine
+  attribution (§6) and so account deletion reaches every contribution,
+  until the account is deleted (by the user, or after 24 months idle).
+  Ownership of a contribution is a per-source key the client holds, not
+  the account.
 
 **Why keypoints are safe enough:** a pose sequence contains no biometric
 image data. Residual honesty: gait-from-keypoints is a real (if nascent)
@@ -160,8 +163,8 @@ beyond minimization is warranted at this scale.
 (§5.6) is computed on the device from the device's own clip library.
 Achievements, levels, progress, scores, and highlights are never sent
 to the farm, and the farm has no table for them. A server-side profile
-would have to know which contributions are whose, which is exactly the
-link the 30-day window removes. Leaderboards, public profiles, and any
+would have to read the account link, which exists for anti-poisoning
+and deletion only. Leaderboards, public profiles, and any
 other public view of achievements are out of scope for that reason and
 for a second one: a private log gives nobody a reason to mislabel, and
 an audience would. *Reopen if:* a social feature is put on the roadmap
@@ -184,11 +187,13 @@ data (`BACKEND_DESIGN.md` §9 Q9) — unlinking would then keep its costs
 (the deletion gap, source-level splits, the moving parts) and lose most
 of its benefit — or a social feature is put on the roadmap. A reversal
 lands before the farm's first deployment, while restoring `user_id` is
-still a plain additive migration. *Under review (2026-11):* the
+still a plain additive migration. *Superseded (2026-11):* the
 maintainer's privacy plan, written with an AI legal-risk review rather
-than counsel, treats unlinked pose sequences as personal data that is
-de-linked and hard to re-identify, not anonymous, and proposes keeping
-the link until deletion (`BACKEND_DESIGN.md` §8.1). Not built yet.
+than counsel, treats unlinked pose sequences as personal data, so the
+farm now keeps `source_attribution` until the account is deleted, by
+the user or after 24 months idle (`BACKEND_DESIGN.md` §1.2.17). Ownership
+still lives in the source key, and `sources` still has no account
+column.
 
 **What this kills from DESIGN.md Rev 8:** presigned video upload to R2,
 server-side video storage, server-rendered video feed, and every sentence
@@ -263,9 +268,12 @@ on the server as training data; the client simply cannot relink them.
   owner reads it through `GET /api/sources/:id` (§4). Deleted with the
   source.
 - `source_attribution` — `source_id` FK, `user_id` FK, `attributed_at`:
-  the account that last wrote the source, deleted 30 days after that
-  write. The only link between a contribution and an account, kept as
-  the "basic level of identification" for bad data (§6).
+  the account that last wrote the source, deleted with the account. The
+  only link between a contribution and an account, kept as the "basic
+  level of identification" for bad data (§6) and for account deletion.
+- `consents` — `user_id` FK, `disclosure_version`, `agreed_at`: each
+  agreement to the app's contribution disclosure; contribution needs
+  the current version (`BACKEND_DESIGN.md` §7.3).
 - `data_quarantine` — `id`, `source_id` FK, `reason`,
   `metrics` (JSONB snapshot), `quarantined_at`, `resolved_at`,
   `resolution` (`released` | `purged`). The training export excludes
@@ -523,16 +531,15 @@ fixture regression suite (the pose fixture clips on R2 plus
 trick-labeled fixtures — segment IoU + name accuracy vs. champion):
 - On regression: (1) fire a **Discord webhook alert** with the metrics
   delta and affected source IDs (never account IDs: an alert outlives
-  the attribution window); (2) **quarantine that day's ingested
+  an account's deletion); (2) **quarantine that day's ingested
   sources** (`data_quarantine`) and skip them in training; (3) skip
   promotion.
 - The engineer reviews the quarantine queue, cleans (purge bad
   sources, release good ones); the next night retries.
 - Attribution comes from the farm's `source_attribution`, which links
-  a source to the account that last wrote it until 30 days after that
-  write. That is the basic identification of who uploaded the bad
-  data, and enough time for the nightly gate and the review. After the
-  window, nobody can tell who uploaded a source.
+  a source to the account that last wrote it until the account is
+  deleted. That is the basic identification of who uploaded the bad
+  data.
 - Achievements make volume spiky (a popular achievement, a new
   release), and a regression on a spike night quarantines everyone's
   data for that day, not only the bad part. Accepted for now; the
@@ -648,7 +655,7 @@ in DESIGN.md Rev 12:
    Its guarantees are unverified.
 3. **Reputation without video.** *Settled in Rev 4:* labels are not
    scored per account, because contributions keep no lasting account
-   link (§1). Quarantine attribution uses the 30-day link (§6).
+   link (§1). Quarantine attribution uses `source_attribution` (§6).
 4. **Landed or bailed.** The app cannot tell a landed rep from a bail.
    Rep counts mean little to a tricker without it, and attempts and
    landings move differently, which matters to the model. An optional

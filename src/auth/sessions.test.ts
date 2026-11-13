@@ -159,6 +159,20 @@ describe.skipIf(!TEST_DATABASE_URL)("sessions with a database", () => {
     });
   });
 
+  test("sign-in marks an idle account active again (§1.2.17)", async () => {
+    await inRollback(sql, async (tx) => {
+      await signIn(tx);
+      await tx`UPDATE users SET last_active_at = now() - interval '25 months' WHERE id = ${SUB}`;
+      apple.respondWith(async () =>
+        Response.json({ id_token: await apple.identityToken(), refresh_token: "second-refresh-token" }),
+      );
+      await signIn(tx);
+      const [{ fresh }] = await tx`
+        SELECT last_active_at > now() - interval '1 minute' AS fresh FROM users WHERE id = ${SUB}`;
+      expect(fresh).toBe(true);
+    });
+  });
+
   test("sign-in purges expired sessions", async () => {
     await inRollback(sql, async (tx) => {
       await tx`INSERT INTO users (id) VALUES ('expired-user')`;

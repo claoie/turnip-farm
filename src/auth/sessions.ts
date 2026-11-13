@@ -7,7 +7,8 @@ import { errorResponse } from "../errors";
 import { AppleUnavailableError, type ExchangeCode, InvalidTokenError, type VerifyIdentityToken } from "./apple";
 import { encryptRefreshToken, newSessionToken, sha256Hex } from "./tokens";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 
 export interface SignInDeps {
   sql: SQL;
@@ -44,6 +45,7 @@ export async function handleSignIn(req: Request, deps: SignInDeps): Promise<Resp
         INSERT INTO users (id, apple_refresh_token) VALUES (${userId}, ${sealed})
         ON CONFLICT (id) DO UPDATE SET
           apple_refresh_token = EXCLUDED.apple_refresh_token,
+          last_active_at      = now(),
           updated_at          = now()`;
       await tx`DELETE FROM sessions WHERE expires_at < now()`;
       const [session] = await tx`
@@ -91,7 +93,7 @@ export async function authenticateClient(
   if (token === null) return unauthenticated("Missing session token");
 
   const [session] = await sql`
-    SELECT s.id, s.user_id, s.last_used_at, u.is_blocked
+    SELECT s.id, s.user_id, s.last_used_at, u.is_blocked, u.last_active_at
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ${sha256Hex(token)} AND s.expires_at > now()`;
@@ -105,6 +107,13 @@ export async function authenticateClient(
       UPDATE sessions
       SET last_used_at = now(), expires_at = now() + interval '90 days'
       WHERE id = ${session.id} AND last_used_at < now() - interval '1 day'`;
+  }
+  // Account activity for the 24-month idle deletion (§1.2.17), at most
+  // hourly for the same reason.
+  if (Date.now() - (session.last_active_at as Date).getTime() > HOUR_MS) {
+    await sql`
+      UPDATE users SET last_active_at = now()
+      WHERE id = ${session.user_id} AND last_active_at < now() - interval '1 hour'`;
   }
   return { userId: session.user_id };
 }

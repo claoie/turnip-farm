@@ -71,6 +71,7 @@ Keep them in a systemd `EnvironmentFile` (e.g.
 | `TURNIP_PIPELINE_KEY` | Random service key for the pipeline endpoints (`BACKEND_DESIGN.md` §7.1). See §9 for rotation |
 | `PORT` | Optional; defaults to `3000` |
 | `INGEST_POLL_INTERVAL_MS` | Optional; ingest poll interval, defaults to `30000`. `0` disables the poller (e.g. when R2 event notifications drive ingest instead) |
+| `CURRENT_DISCLOSURE_VERSION` | Optional; defaults to `3`. The contribution disclosure version an account must have agreed to (`POST /api/consent`) before contributing (`BACKEND_DESIGN.md` §7.3). Raise it only after the app release with the new wording is live: every account is then asked again on its next contribution |
 | `TRUSTED_PROXIES` | Optional; trusted proxy addresses and CIDRs, comma-separated (`src/config.ts` validates the entries, `src/index.ts` feeds them to the rate-limit client-address walk). Set it to the proxy's subnet when the service sits behind a proxy on a non-loopback network (e.g. the Docker/CD image path) — otherwise every client looks like the proxy's address. Harmless to omit behind Caddy on loopback (`BACKEND_DESIGN.md` §7.2) |
 
 ## 3. Postgres
@@ -84,8 +85,8 @@ Keep them in a systemd `EnvironmentFile` (e.g.
 3. Backups (§8 / §9 Q10 — **30 days max**): nightly
    `pg_dump --format=custom` to a local directory, then prune anything
    older than 30 days (`find <dir> -name '*.dump' -mtime +30 -delete`).
-   A backup that outlives the 30-day window is a privacy defect, not an
-   ops nicety.
+   A backup older than 30 days still holds deleted accounts and their
+   contributions: a privacy defect, not an ops nicety.
 
 ## 4. The Bun service
 
@@ -216,9 +217,11 @@ implements it:
 | Farm logs | systemd journal with `MaxRetentionSec=30day`, or file + `logrotate` keeping 30 days |
 | Caddy access logs | `logrotate`, 30 days max (§6) |
 
-Plus the in-app guarantees that need no ops work: `source_attribution`
-is purged 30 days after a source's last write (hourly in-process purge),
-and reports are deleted 30 days after filing.
+Plus the in-app jobs that need no ops work (hourly, in process):
+reports are deleted 30 days after filing, and accounts idle for 24
+months are deleted with their attributed contributions
+(`BACKEND_DESIGN.md` §1.2.17). `source_attribution` itself is kept
+until its account is deleted.
 
 ## 11. Cutover to managed Postgres
 

@@ -40,9 +40,9 @@ Two departures from the master plan's label draft follow from this:
 - **No per-label `user_id`.** Only the source's owner ever submits labels
   (the confirmed contribution flow has no community labeling queue), so
   attribution is `labels → clips → sources → source_attribution`, which
-  is also the attribution the quarantine flow uses, and it exists only
-  for 30 days after the source's last write (§1.2.17). A per-label
-  `user_id` would be a second, longer-lived link to the same account.
+  is also the attribution the quarantine flow uses, and it is deleted
+  with the account (§1.2.17). A per-label `user_id` would be a second
+  link to the same account for deletion to chase.
 - **No per-label `start_frame` / `end_frame`.** The label window *is* the
   clip window. The training target is one segment per confirmed clip window
   (master plan §6), so a second, label-level window is redundant. If a
@@ -139,46 +139,46 @@ Two departures from the master plan's label draft follow from this:
     `getCredentialState` on launch (§7.1).
 16. **Blocked users can still leave.** `is_blocked` removes contribution
     rights, not the right to sign out or delete the account (§7.1).
-17. **Contributions are linked to an account for 30 days at most.** The
-    farm needs to know *who* contributed for one purpose: finding and
-    blocking an account that poisons the dataset (master plan §6), which
-    takes days, not years. So `sources` carries no account column.
-    Instead, a `source_attribution` row links a source to the account
-    that last wrote it. Every contribution write refreshes it, and it is
-    deleted 30 days after the source's last write: a source that is still
-    being edited stays linked, and one left alone is unlinked 30 days
-    after its last edit. Nothing else needs the link. Ownership is the
-    source key (§1.2.13), training splits by source rather than by user,
-    and reputation is not computed from contributions (§9 Q2). Reports
-    are the one other place an account meets a contribution:
+17. **Contributions stay linked to an account until it is deleted.**
+    *Changed 2026-11 by the maintainer's privacy plan* (§8.1), written
+    with an AI legal-risk review rather than counsel. `sources` carries
+    no account column. Instead, a `source_attribution` row links a
+    source to the account that last wrote it, and every contribution
+    write refreshes it. The row lasts until the account is deleted: by
+    the user (`DELETE /api/account`), by Apple's `account-deleted`
+    notification, or by the farm after 24 months without activity
+    (`users.last_active_at`, set at sign-in and, at most hourly, by
+    authenticated requests). An hourly job deletes idle accounts
+    through the same steps as `DELETE /api/account` (§7.3), so their
+    attributed sources go with them.
+    The link serves two purposes: finding and blocking an account that
+    poisons the dataset (master plan §6), and letting account deletion
+    reach every contribution the account made. Ownership is still the
+    source key (§1.2.13), training still splits by source, and
+    reputation is still not computed from contributions (§9 Q2).
+    *Why the change:* the plan treats unlinked pose sequences as
+    personal data anyway, since a sequence can be matched against a
+    public video of the person in it and anyone holding an imported file
+    can recompute its `video_id` (§9 Q9). On that view the 30-day unlink
+    removed the user's ability to delete their data without making the
+    data anonymous. Keeping the link makes deletion complete.
+    *Consent:* the farm records each agreement to the app's contribution
+    disclosure (`consents`, §7.3 `POST /api/consent`), and contribution
+    writes require the current version (`CURRENT_DISCLOSURE_VERSION`,
+    3). Version 3 is the first that says attribution is kept until
+    deletion. An account that never agreed to version 3 or later was
+    told 30 days, so its attribution keeps the 30-day purge (§4); it
+    cannot write again until it agrees to the current version.
+    Reports are the one other place an account meets a contribution:
     `reports.reporter_user_id` sits next to a `target_id`, and since
     only a source's key holder can see it, the reporter is usually its
-    contributor. Reports are therefore deleted 30 days after they are
-    filed, by the same purge (§4). Once unlinked, the farm treats a
-    contribution as belonging to no account.
-    Some linkage remains possible outside the farm's records: a pose
-    sequence can be matched against a public video of the person in it,
-    and anyone holding an imported file can recompute its `video_id`.
-    Whether that makes unlinked contributions personal data is a question
-    for counsel (§9 Q9).
-    *Re-weighed and kept, 2026-10-15* (master plan §1). Linking would
-    buy complete account deletion, splits by person, per-labeler
-    reliability, and restore on any device; it would cost one
-    re-identified video identifying every other video under the same
-    account. The app's Profile tab needs no link (§1.2.21). Unlinking is
-    not a one-way door: the client keeps every source's key, so a future
-    opt-in "link my contributions" call, taking source keys, can re-link
-    the sources whose keys it still holds, on the user's say. *Reopen
-    if:* counsel answers §9 Q9 that unlinked pose sequences are personal
-    data anyway, or a social feature is put on the roadmap. A reversal
-    lands before the first deployment, while restoring `sources.user_id`
-    is a plain additive migration.
-    *Under review (2026-11):* the maintainer's privacy plan, written
-    with an AI legal-risk review rather than counsel, treats unlinked
-    pose sequences as personal data that is de-linked and hard to
-    re-identify, not anonymous. It proposes keeping the account link
-    until deletion, plus a 24-month inactivity expiry, in place of the
-    30-day purge (§8.1). Not built yet.
+    contributor. Reports are still deleted 30 days after they are filed
+    (§4). Logs and backups keep their 30-day caps (§8).
+    *History:* from 2026-10-12 to 2026-11 the link was deleted 30 days
+    after the source's last write, re-weighed and kept on 2026-10-15
+    (master plan §1). The client still keeps every source's key, so
+    `DELETE /api/sources/:id` works whether or not the source is
+    attributed.
 18. **Labels carry provenance, never identity.** Each label row records
     its `origin`: `typed` (typed by hand), `vocabulary` (picked from the
     vocabulary's suggestions), or `model` (pre-filled by the trick model
@@ -261,12 +261,27 @@ CREATE TABLE users (
   is_blocked  BOOLEAN NOT NULL DEFAULT FALSE,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_active_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Set at sign-in and, at most hourly, by authenticated requests (§7.1).
+  -- Accounts idle for 24 months are deleted (§1.2.17).
   apple_refresh_token BYTEA
   -- Apple refresh token from the sign-in code exchange (§7.1), used only
   -- to revoke the user's authorization on account deletion (§1.2.15).
   -- AES-256-GCM under APPLE_REFRESH_TOKEN_KEY with users.id as additional
   -- authenticated data, stored as 12-byte nonce || ciphertext || 16-byte
   -- tag. NULL after consent-revoked (§7.3).
+);
+
+CREATE INDEX users_last_active_at_idx ON users (last_active_at);
+
+CREATE TABLE consents (
+  user_id            TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  disclosure_version INTEGER NOT NULL CHECK (disclosure_version > 0),
+  -- The contribution disclosure the account agreed to; the app shows it
+  -- with the 16+ confirmation (§7.1).
+  agreed_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- The first agreement to that version; agreeing again keeps it.
+  PRIMARY KEY (user_id, disclosure_version)
 );
 
 CREATE TABLE sessions (
@@ -321,10 +336,12 @@ CREATE TABLE source_attribution (
   source_id     CHAR(64) PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
   user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   -- The account that last wrote the source (§1.2.17): the only link
-  -- between a contribution and an account, kept for anti-poisoning.
+  -- between a contribution and an account, kept for anti-poisoning and
+  -- for account deletion.
   attributed_at TIMESTAMPTZ NOT NULL DEFAULT now()
-  -- Refreshed by every contribution write (§4); the row is deleted 30
-  -- days after it. The farm keeps no other record of the link.
+  -- Refreshed by every contribution write (§4). Deleted with the account,
+  -- or 30 days after it for an account that never agreed to disclosure
+  -- version 3 (§4). The farm keeps no other record of the link.
 );
 CREATE INDEX source_attribution_user_id_idx ON source_attribution (user_id);
 CREATE INDEX source_attribution_attributed_at_idx
@@ -565,17 +582,33 @@ ON CONFLICT (source_id) DO UPDATE SET
   attributed_at = now();
 ```
 
-The farm process deletes expired rows at startup and hourly, together
-with reports past the same window (§1.2.17):
+The row lasts until the account is deleted (§1.2.17). The farm process
+runs its retention jobs at startup and hourly (`src/contrib/purge.ts`,
+`src/auth/account.ts`). Reports are deleted 30 days after they are
+filed, and so is the attribution of accounts that only ever agreed to
+the 30-day disclosure (versions before 3):
 
 ```sql
-DELETE FROM source_attribution WHERE attributed_at < now() - interval '30 days';
-DELETE FROM reports            WHERE created_at    < now() - interval '30 days';
+DELETE FROM source_attribution a
+WHERE a.attributed_at < now() - interval '30 days'
+  AND NOT EXISTS (SELECT 1 FROM consents c
+                  WHERE c.user_id = a.user_id AND c.disclosure_version >= 3);
+DELETE FROM reports WHERE created_at < now() - interval '30 days';
 ```
 
-Every read of `source_attribution` also filters on
-`attributed_at >= now() - interval '30 days'`, so a late purge never
-extends the link.
+Then accounts idle for 24 months are deleted, up to 100 per run, each
+through the `DELETE /api/account` steps (§7.3); one that fails (Apple
+unreachable, R2 down) is retried on the next run:
+
+```sql
+SELECT id FROM users
+WHERE last_active_at < now() - make_interval(months => 24)
+ORDER BY last_active_at, id
+LIMIT 100;
+```
+
+Reads of `source_attribution` (account deletion, the moderation lookup)
+take every row; there is no window to filter on.
 
 **`clips`** — batch upsert, one statement for the whole batch:
 
@@ -861,15 +894,19 @@ for `users.apple_refresh_token`).
 - Account deletion: delete every source the app holds a key for, then
   call `DELETE /api/account`, then delete the local keys and session
   token (§7.3).
-- Disclosure, shown at contribution consent and again at account
-  deletion: contributions stay linked to the account for 30 days after
-  the last edit, and after that are kept without any link to it.
-  Deleting the account removes every contribution the app can still
-  find. The rest remain in the training data with no link to the
-  account, though someone with a video of the same clip could still
-  match them to it (§9 Q9). The consent copy also asks users to
-  contribute only clips of themselves, or of people who agreed: the
-  person in a clip may not be the account holder.
+- Consent: the contribution sheet shows the disclosure with a required
+  "I'm 16 or older" confirmation, and Confirm calls `POST /api/consent`
+  with the disclosure's version (§7.3). On `403 CONSENT_REQUIRED` from
+  a contribution write, the app shows the sheet again. On
+  `403 REGION_UNAVAILABLE`, it stops offering contribution.
+- Disclosure (version 3), shown at contribution consent and again at
+  account deletion: contributions stay linked to the account until the
+  account is deleted, by the user or after 24 months without use, and
+  deleting the account deletes them. The consent copy also asks users
+  to contribute only clips of themselves, or of people who agreed: the
+  person in a clip may not be the account holder. Versions 1 and 2 said
+  contributions were unlinked 30 days after the last edit; the farm
+  still honors that for accounts that agreed only to them (§1.2.17).
 
 ### 7.2 Conventions
 
@@ -882,7 +919,9 @@ for `users.apple_refresh_token`).
 
   Codes: `UNAUTHENTICATED` (401), `ACCOUNT_BLOCKED` (403),
   `REGION_UNAVAILABLE` (403: contribution is switched off in the
-  request's country, see "Country backstop" below), `NOT_FOUND`
+  request's country, see "Country backstop" below), `CONSENT_REQUIRED`
+  (403: the account has not agreed to the current contribution
+  disclosure, §7.3 `POST /api/consent`), `NOT_FOUND`
   (404), `NO_MODEL` (404), `VALIDATION_ERROR` (422), `UNSUPPORTED_FORMAT` (422),
   `BLOB_MISSING` (422), `BLOB_DIGEST_MISMATCH` (422),
   `SOURCE_ALREADY_CLAIMED` (409), `VERSION_EXISTS` (409),
@@ -914,7 +953,7 @@ for `users.apple_refresh_token`).
 - **Country backstop:** contribution is switched off in the EU 27,
   Iceland, Liechtenstein, Norway and the UK (§8.1). The app hides it on
   those storefronts; the farm refuses the contribution entry points
-  (`POST /api/sources` today, `POST /api/consent` once it lands) with
+  (`POST /api/consent` and `POST /api/sources`) with
   `403 REGION_UNAVAILABLE` when Cloudflare's `CF-IPCountry` header holds
   one of those ISO 3166-1 alpha-2 codes (`src/region.ts`). The check
   runs before authentication, so a refused request touches nothing. A
@@ -993,15 +1032,15 @@ sign out cleanly. Allowed for blocked users.
 App Review guideline 5.1.1(v). Session required; allowed for blocked
 users.
 
-**Client first.** Contributions are not linked to the account beyond
-the attribution window (§1.2.17), so the farm cannot find them all.
-Before calling this endpoint, the app deletes every source it holds a
-key for, with `DELETE /api/sources/:id`. The farm cannot enforce this
-step. Contributions whose keys the app no longer holds, and that are
-past the window, remain as training data that no record links to the
+**Client first.** Before calling this endpoint, the app deletes every
+source it holds a key for, with `DELETE /api/sources/:id`. The farm
+deletes every source attributed to the account itself (step 2), so this
+step only matters for sources the account no longer holds the
+attribution for: ones another account wrote last, and, for an account
+that agreed only to the 30-day disclosure, ones past that window
+(§1.2.17). Those remain as training data that no record links to the
 user, though they can still be matched to a video of the same clip
-(§9 Q9). The app says so when the user contributes and again when they
-delete the account (§7.1, §8).
+(§9 Q9).
 
 **Then the server**, in order, so a retry after a partial failure
 finishes the job:
@@ -1014,13 +1053,54 @@ finishes the job:
    Unreachable, timeout, or 5xx → `503 APPLE_UNAVAILABLE` with nothing
    deleted. Any other error is logged and deletion proceeds: the user's
    right to delete does not depend on Apple's answer.
-2. Delete every source still attributed to the user (within the
-   window, §4): first its R2 blob and any staged upload, then the row.
-   Clips, labels, quarantine rows, and attribution cascade.
-3. `DELETE FROM users WHERE id = $1`. Sessions, reports, and any
-   remaining attribution rows cascade.
+2. Delete every source attributed to the user (§4): first its R2 blob
+   and any staged upload, then the row. Clips, labels, quarantine rows,
+   training membership and attribution cascade.
+3. `DELETE FROM users WHERE id = $1`. Sessions, consents and reports
+   cascade.
 
 Response `204`. A retry after success gets `401` (the session is gone).
+The hourly idle-account job runs the same three steps for accounts idle
+for 24 months (§1.2.17, §4).
+
+#### `POST /api/consent` — record agreement to the contribution disclosure
+
+Session required. Request:
+
+```json
+{"disclosure_version": 3, "age_confirmed": true}
+```
+
+Refused first with `403 REGION_UNAVAILABLE` from a country where
+contribution is off (§7.2 "Country backstop"). Then the usual session
+checks and the per-user POST bucket (§7.2).
+
+Validation: `disclosure_version` is an integer from 1 to 2147483647;
+otherwise `422 VALIDATION_ERROR` with `details.field =
+"disclosure_version"`. `age_confirmed` must be the JSON value `true`
+(the user confirmed they are 16 or older); missing, `false` or any other
+value is `422 VALIDATION_ERROR` with `details.field = "age_confirmed"`.
+
+Behavior: records the agreement in `consents`. Agreeing again to a
+version already recorded keeps the first `agreed_at`. Any positive
+version is recorded, but contribution writes need the current one.
+
+Response `204`, no body.
+
+**The gate.** `POST /api/sources`, `POST /api/clips` and
+`POST /api/clips/:id/labels` answer `403 CONSENT_REQUIRED` unless the
+account has a `consents` row with `disclosure_version >=
+CURRENT_DISCLOSURE_VERSION` (configuration, default 3). The check runs
+after authentication and rate limiting, before validation, and
+`details.disclosure_version` carries the version the farm requires:
+
+```json
+{"error": {"code": "CONSENT_REQUIRED", "message": "...", "details": {"disclosure_version": 3}}}
+```
+
+Raising `CURRENT_DISCLOSURE_VERSION` asks every account to agree again
+on its next contribution. An app release with the new wording has to
+ship first, since an older app can only send the version it shows.
 
 #### `POST /api/auth/apple/notifications` — Apple server-to-server notifications
 
@@ -1058,8 +1138,7 @@ By `events.type`, for the user `events.sub`:
   sign in again, or delete the account.
 - `account-deleted` (the user deleted their Apple Account; Apple has
   invalidated all their tokens, and they can never sign in again to
-  delete their data): run `DELETE /api/account` steps 2 and 3. Sources
-  past the attribution window are not linked to the account and stay.
+  delete their data): run `DELETE /api/account` steps 2 and 3.
 - `email-enabled`, `email-disabled`: ignored. These events carry an
   email address, which the farm never stores or logs.
 
@@ -1082,7 +1161,9 @@ Request:
 ```
 
 Refused first with `403 REGION_UNAVAILABLE` from a country where
-contribution is off (§7.2 "Country backstop").
+contribution is off (§7.2 "Country backstop"), then, after the session
+and rate-limit checks, with `403 CONSENT_REQUIRED` unless the account
+agreed to the current disclosure (§7.3 `POST /api/consent`).
 
 Validation: `video_id` matches `^[0-9a-f]{64}$`; `source_key` is 43
 base64url characters (§7.2); `frame_count > 0`; `sample_rate` in
@@ -1155,6 +1236,10 @@ Request:
 provenance (§1.2.18). Each `labels` entry is an object; `origin` is
 required, one of `typed | vocabulary | model`.
 
+After the session and rate-limit checks, an account that has not agreed
+to the current disclosure gets `403 CONSENT_REQUIRED` (§7.3
+`POST /api/consent`).
+
 Behavior, in a single transaction:
 
 1. For each clip: the source must exist, its `source_key` must match,
@@ -1209,8 +1294,8 @@ Request:
 }
 ```
 
-Behavior: the clip must exist and `source_key` must match its source
-(`404` otherwise); labels validate as in `POST /api/clips` against the
+Behavior: `403 CONSENT_REQUIRED` as on `POST /api/clips`; then the clip
+must exist and `source_key` must match its source (`404` otherwise); labels validate as in `POST /api/clips` against the
 clip's stored provenance; runs the §5 replacement for that clip only
 and records the caller in `source_attribution` (§4). Idempotent:
 submitting the current set is a no-op semantically.
@@ -1558,23 +1643,26 @@ checklist:
   authorization codes, refresh tokens, session tokens, source keys, or
   pose data.
 - Contributions carry no account identifier. The only link is
-  `source_attribution`, deleted 30 days after a source's last write
-  (§1.2.17), and nothing may outlive it:
+  `source_attribution`, kept until the account is deleted (§1.2.17),
+  and no other copy of it may outlive a deletion by more than 30 days:
   - **Logs:** request logs never record a user ID or session ID next to
     a source or clip ID. The farm's logs and the reverse proxy's access
     logs are kept 30 days at most.
-  - **Backups:** database backups are kept 30 days at most.
+  - **Backups:** database backups are kept 30 days at most, so a
+    deleted account leaves the backups within 30 days.
   - **Alerts:** anti-poisoning alerts name sources and counts, never
-    accounts. The maintainer reads attribution from the database while
-    it exists.
+    accounts. The maintainer reads attribution from the database.
   - **Exports:** nothing exported to training carries an account
     identifier (§6).
   - **Reports:** deleted 30 days after they are filed, since the
     reporter is usually the target's contributor (§1.2.17).
-- Account deletion (§7.3) removes the account, its sessions, and every
-  contribution still attributed to it or still keyed on the device.
-  Contributions the device can no longer find stay, unlinked; users are
-  told so at consent and at deletion. Deleted data leaves the next
+- Consent is recorded per account and disclosure version (`consents`),
+  and contribution requires the current version and a 16+ confirmation
+  (§7.3 `POST /api/consent`).
+- Account deletion (§7.3) removes the account, its sessions, its
+  consents, and every contribution attributed to it or still keyed on
+  the device. Accounts idle for 24 months are deleted the same way
+  (§1.2.17). Deleted data leaves the next
   training dataset, because training rebuilds from a full pull (§6).
   Models already trained on it are treated as anonymous, pending the
   assessment in §9 Q8.
@@ -1589,15 +1677,9 @@ live. Items move out of this list into the sections above as they are
 built; until then, the sections above describe the code. The app side
 is in turnip-ios `CONTRIBUTION_DESIGN.md` §8.1.
 
-- **Consent on the farm.** Each agreement is recorded with its account,
-  time and disclosure version. Accounts that agreed to the 30-day wording
-  are asked again. Users must be 16 or older.
-- **Retention.** `source_attribution` is kept until the user deletes it,
-  or after 24 months without activity, in place of the 30-day purge
-  (§1.2.17). Logs and backups keep their 30-day caps.
 - **Deletion.** Account deletion removes the account, sessions, Apple
-  token, attribution and full-session pose. The app also offers "Also
-  delete my contributions".
+  token, attribution and full-session pose, and keeps only de-linked
+  segments. The app also offers "Also delete my contributions".
 - **Labels.** Only vocabulary names are accepted. A new name goes to a
   candidate list, counted per account by keyed hash, kept briefly and
   promoted by hand.
@@ -1646,9 +1728,9 @@ is in turnip-ios `CONTRIBUTION_DESIGN.md` §8.1.
    (§1.2.17). Counsel should confirm whether that leaves them personal
    data. The answer is now also a reopen trigger for unlinking itself:
    if unlinked pose sequences are personal data anyway, linking may be
-   the better trade (§1.2.17). *Proposed answer (2026-11), not from
-   counsel:* treat them as personal data, de-linked and hard to
-   re-identify, and keep the link until deletion (§8.1).
+   the better trade (§1.2.17). *Working answer (2026-11), not from
+   counsel:* treat them as personal data and keep the link until
+   deletion; built (§1.2.17). Counsel's answer is still wanted.
 10. **Log and backup retention.** §8 caps logs and database backups at
     30 days; the deployment runbook has to implement that for Postgres
     backups, the farm's logs, and the reverse proxy's access logs.

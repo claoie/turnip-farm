@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ConfigError, DEFAULT_PORT, REQUIRED_ENV, loadConfig } from "./config";
+import { ConfigError, DEFAULT_DISCLOSURE_VERSION, DEFAULT_PORT, REQUIRED_ENV, loadConfig } from "./config";
 import { parseProxyRange } from "./ratelimit";
 
 const PEM_LINES = ["-----BEGIN PRIVATE KEY-----", "MIGTAgEAMBMGByqGSM49AgEGCCqGSM49", "-----END PRIVATE KEY-----"];
@@ -50,7 +50,19 @@ describe("loadConfig", () => {
       },
       pipelineKey: "pipeline-key",
       trustedProxies: [],
+      currentDisclosureVersion: DEFAULT_DISCLOSURE_VERSION,
     });
+  });
+
+  test("reads CURRENT_DISCLOSURE_VERSION, defaulting to 3", () => {
+    expect(DEFAULT_DISCLOSURE_VERSION).toBe(3);
+    expect(loadConfig({ ...FULL_ENV, CURRENT_DISCLOSURE_VERSION: "4" }).currentDisclosureVersion).toBe(4);
+    expect(loadConfig({ ...FULL_ENV, CURRENT_DISCLOSURE_VERSION: " " }).currentDisclosureVersion).toBe(3);
+    for (const bad of ["0", "-1", "3.5", "three", "2147483648"]) {
+      expect(problemsFor({ ...FULL_ENV, CURRENT_DISCLOSURE_VERSION: bad })).toEqual([
+        `CURRENT_DISCLOSURE_VERSION must be a positive integer (got "${bad}")`,
+      ]);
+    }
   });
 
   test("accepts a PEM with real newlines", () => {

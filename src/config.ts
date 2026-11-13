@@ -29,6 +29,10 @@ export interface Config {
   // Proxies, besides loopback, whose X-Forwarded-For per-IP rate limits
   // read through (BACKEND_DESIGN.md §7.2). Empty when unset.
   trustedProxies: ProxyRange[];
+  // The contribution disclosure version the app must have recorded with
+  // POST /api/consent before contributing (BACKEND_DESIGN.md §7.3).
+  // Default DEFAULT_DISCLOSURE_VERSION.
+  currentDisclosureVersion: number;
 }
 
 export const REQUIRED_ENV = [
@@ -46,6 +50,10 @@ export const REQUIRED_ENV = [
 ] as const;
 
 export const DEFAULT_PORT = 3000;
+
+// Default CURRENT_DISCLOSURE_VERSION: the app's disclosure that says
+// attribution is kept until deletion (BACKEND_DESIGN.md §1.2.17).
+export const DEFAULT_DISCLOSURE_VERSION = 3;
 
 type Env = Record<string, string | undefined>;
 
@@ -96,7 +104,20 @@ export function loadConfig(env: Env): Config {
     }
   }
 
-  if (problems.length > 0 || port === null || privateKeyPem === undefined || refreshTokenKey === null) {
+  const currentDisclosureVersion = parseDisclosureVersion(env.CURRENT_DISCLOSURE_VERSION);
+  if (currentDisclosureVersion === null) {
+    problems.push(
+      `CURRENT_DISCLOSURE_VERSION must be a positive integer (got "${env.CURRENT_DISCLOSURE_VERSION}")`,
+    );
+  }
+
+  if (
+    problems.length > 0 ||
+    port === null ||
+    currentDisclosureVersion === null ||
+    privateKeyPem === undefined ||
+    refreshTokenKey === null
+  ) {
     throw new ConfigError(problems);
   }
 
@@ -118,7 +139,15 @@ export function loadConfig(env: Env): Config {
     },
     pipelineKey: required.TURNIP_PIPELINE_KEY,
     trustedProxies,
+    currentDisclosureVersion,
   };
+}
+
+function parseDisclosureVersion(raw: string | undefined): number | null {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_DISCLOSURE_VERSION;
+  if (!/^\d+$/.test(raw.trim())) return null;
+  const version = Number(raw);
+  return version >= 1 && version <= 2_147_483_647 ? version : null;
 }
 
 function parseKey(raw: string | undefined): Uint8Array<ArrayBuffer> | null {

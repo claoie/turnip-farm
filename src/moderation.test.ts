@@ -74,11 +74,11 @@ describeDb("attributedAccount", () => {
       expect(await attributedAccount(tx, SOURCE_ID)).toEqual({ userId: USER_ID, isBlocked: false });
     }));
 
-  test("returns null past the 30-day window, even before the purge has run", async () =>
+  test("still answers at day 31: attribution is kept until deletion (§1.2.17)", async () =>
     inRollback(sharedSql, async (tx) => {
       await seedUser(tx, USER_ID);
       await seedAttributedSource(tx, SOURCE_ID, USER_ID, 31);
-      expect(await attributedAccount(tx, SOURCE_ID)).toBeNull();
+      expect(await attributedAccount(tx, SOURCE_ID)).toEqual({ userId: USER_ID, isBlocked: false });
     }));
 
   test("returns null for an unknown source", async () =>
@@ -99,10 +99,11 @@ describeDb("source-account CLI", () => {
       expect([...c.out, ...c.err].join("\n")).not.toContain(SOURCE_ID);
     }));
 
-  test("exits 1 without naming an account when the attribution has expired", async () =>
+  test("exits 1 without naming an account when the source has no attribution", async () =>
     inRollback(sharedSql, async (tx) => {
       await seedUser(tx, USER_ID);
-      await seedAttributedSource(tx, SOURCE_ID, USER_ID, 31);
+      await seedAttributedSource(tx, SOURCE_ID, USER_ID);
+      await tx`DELETE FROM source_attribution WHERE source_id = ${SOURCE_ID}`;
       const c = capture();
       expect(await sourceAccountCli([SOURCE_ID], tx, c.io)).toBe(1);
       expect(c.out).toEqual([]);
@@ -141,12 +142,13 @@ describeDb("blocking", () => {
           keypoint_format: "tkp1",
         }),
       }),
-      { sql: tx, r2: fakeR2, limits },
+      { sql: tx, r2: fakeR2, limits, currentDisclosureVersion: 3 },
     );
 
   test("block stops contributions at once; the session survives; clear restores them", async () =>
     inRollback(sharedSql, async (tx) => {
       await seedUser(tx, USER_ID);
+      await tx`INSERT INTO consents (user_id, disclosure_version) VALUES (${USER_ID}, 3)`;
       await tx`INSERT INTO sessions (user_id, token_hash, expires_at)
         VALUES (${USER_ID}, ${sha256Hex(SESSION_TOKEN)}, now() + interval '1 hour')`;
 

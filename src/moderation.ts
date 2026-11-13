@@ -5,14 +5,13 @@
 // During quarantine review the maintainer resolves a source to the account
 // that last wrote it, then decides whether to block that account. Blocking
 // stops future contributions (403 ACCOUNT_BLOCKED from authenticateClient);
-// sources already contributed are removed by a quarantine purge (§1.2.3),
-// since attribution expires. A blocked account keeps its sessions so it can
-// still sign out and delete itself (§1.2.16).
+// sources already contributed are removed by a quarantine purge (§1.2.3).
+// A blocked account keeps its sessions so it can still sign out and delete
+// itself (§1.2.16).
 //
-// Attribution exists for 30 days only, and §8 forbids an account id from
-// sitting next to anything that outlives it. So the lookup reads only
-// inside the window, and the CLI prints the account id without the source
-// id or anything else about the source.
+// §8 forbids an account id from sitting next to anything that outlives the
+// attribution, so the CLI prints the account id without the source id or
+// anything else about the source.
 
 import type { SQL } from "bun";
 import { isVideoId } from "./contrib/validate";
@@ -23,15 +22,14 @@ export interface AttributedAccount {
 }
 
 // The account that last wrote the source, or null when the source is
-// unknown or its attribution is past the 30-day window. The window filter
-// is here rather than trusted to the hourly purge, so a late purge never
-// extends the link (§4).
+// unknown or has no attribution (its account was deleted, or the 30-day
+// purge removed it, §1.2.17).
 export async function attributedAccount(sql: SQL, sourceId: string): Promise<AttributedAccount | null> {
   const [row] = await sql`
     SELECT a.user_id, u.is_blocked
     FROM source_attribution a
     JOIN users u ON u.id = a.user_id
-    WHERE a.source_id = ${sourceId} AND a.attributed_at >= now() - interval '30 days'`;
+    WHERE a.source_id = ${sourceId}`;
   return row ? { userId: row.user_id as string, isBlocked: row.is_blocked as boolean } : null;
 }
 
@@ -57,7 +55,7 @@ export interface Output {
 }
 
 // scripts/source-account.ts <source_id>. Exit status: 0 found, 1 no
-// account within the window, 2 usage.
+// attributed account, 2 usage.
 export async function sourceAccountCli(args: string[], sql: SQL, io: Output): Promise<number> {
   const [sourceId] = args;
   if (args.length !== 1 || !isVideoId(sourceId)) {
@@ -66,7 +64,7 @@ export async function sourceAccountCli(args: string[], sql: SQL, io: Output): Pr
   }
   const account = await attributedAccount(sql, sourceId);
   if (account === null) {
-    io.err("No account: the source is unknown or its attribution is past the 30-day window.");
+    io.err("No account: the source is unknown or no longer attributed to an account.");
     return 1;
   }
   // The account id alone, never next to the source id (§8).

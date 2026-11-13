@@ -13,6 +13,7 @@ import type { SQL } from "bun";
 import { sha256Hex } from "../auth/tokens";
 import { authenticateClient } from "../auth/sessions";
 import { transaction } from "../db";
+import { requireConsent } from "../consent";
 import { errorResponse } from "../errors";
 import {
   BlobTooLargeError,
@@ -36,6 +37,8 @@ export interface ClipsDeps {
   sql: SQL;
   r2: R2Client;
   limits: RateLimits;
+  /** The disclosure version clip writes require (§7.3 POST /api/consent). */
+  currentDisclosureVersion: number;
 }
 
 const notFound = () => errorResponse(404, "NOT_FOUND", "Not found");
@@ -133,6 +136,8 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
   if (auth instanceof Response) return auth;
   const limited = rateLimit(deps, auth.userId);
   if (limited) return limited;
+  const unconsented = await requireConsent(deps.sql, auth.userId, deps.currentDisclosureVersion);
+  if (unconsented) return unconsented;
 
   const body = await readJsonObject(req);
   if (!Array.isArray(body?.clips)) return invalid("clips must be an array");
@@ -273,6 +278,8 @@ export async function handlePostClipLabels(
   if (auth instanceof Response) return auth;
   const limited = rateLimit(deps, auth.userId);
   if (limited) return limited;
+  const unconsented = await requireConsent(deps.sql, auth.userId, deps.currentDisclosureVersion);
+  if (unconsented) return unconsented;
   if (!isUuid(clipId)) return notFound();
 
   const body = await readJsonObject(req);

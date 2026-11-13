@@ -1,9 +1,8 @@
 // Contribution: sources (BACKEND_DESIGN.md §7.3).
 // Ownership is a per-source key (§1.2.13); a missing or wrong key is 404,
 // never 403, so source IDs are not an ownership oracle (§7.2). Every write
-// upserts source_attribution in the same transaction (§4); reads of
-// attribution filter the 30-day window (§1.2.17) — this module only writes
-// it. Logs never carry user/session IDs next to source IDs, nor source
+// upserts source_attribution in the same transaction (§4); this module
+// only writes it. Logs never carry user/session IDs next to source IDs, nor source
 // keys (§8).
 
 import type { SQL } from "bun";
@@ -14,6 +13,7 @@ import { authenticateClient } from "../auth/sessions";
 import { canonicalKeyFor, stagingKeyFor } from "../r2/keys";
 import type { R2Client } from "../r2/client";
 import type { RateLimits } from "../app";
+import { requireConsent } from "../consent";
 import { refuseBlockedRegion } from "../region";
 import { isSourceKey, isVideoId, readJsonObject } from "./validate";
 
@@ -21,6 +21,8 @@ export interface SourcesDeps {
   sql: SQL;
   r2: R2Client;
   limits: RateLimits;
+  /** The disclosure version registration requires (§7.3 POST /api/consent). */
+  currentDisclosureVersion: number;
 }
 
 type Authed = { userId: string };
@@ -56,6 +58,8 @@ export async function handleRegisterSource(req: Request, deps: SourcesDeps): Pro
   if (auth instanceof Response) return auth;
   const limited = rateLimit(deps, auth.userId);
   if (limited) return limited;
+  const unconsented = await requireConsent(deps.sql, auth.userId, deps.currentDisclosureVersion);
+  if (unconsented) return unconsented;
 
   const body = await readJsonObject(req);
   const videoId = body?.video_id;

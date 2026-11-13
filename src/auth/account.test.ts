@@ -7,7 +7,8 @@ import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { TEST_DATABASE_URL, inRollback } from "../../db/testing";
 import type { R2Client } from "../r2/client";
 import { AppleUnavailableError } from "./apple";
-import { handleDeleteAccount, type AccountDeps } from "./account";
+import { IDLE_ACCOUNT_MONTHS, deleteIdleAccounts, handleDeleteAccount, type AccountDeps } from "./account";
+import { authenticateClient } from "./sessions";
 import { encryptRefreshToken, importRefreshTokenKey, sha256Hex } from "./tokens";
 
 const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
@@ -117,7 +118,7 @@ describeDb("DELETE /api/account", () => {
       expect(user).toBeUndefined();
     }));
 
-  test("deletes the account end to end: revoke, attributed blobs, cascades", async () =>
+  test("deletes the account end to end: revoke, every attributed source's blobs, cascades", async () =>
     inRollback(sharedSql, async (tx) => {
       const { token, refreshKey } = await seedUser(tx, USER_ID);
       await seedUser(tx, OTHER_USER);
@@ -130,6 +131,7 @@ describeDb("DELETE /api/account", () => {
         VALUES (${CLIP_ID}::uuid, 'backflip', 1)`;
       await tx`INSERT INTO reports (reporter_user_id, target_type, target_id, reason)
         VALUES (${USER_ID}, 'source', ${OTHER_SOURCE_ID}, 'test report')`;
+      await tx`INSERT INTO consents (user_id, disclosure_version) VALUES (${USER_ID}, 3)`;
 
       const r2 = fakeR2();
       const d = deps(tx, refreshKey, r2);
@@ -139,9 +141,15 @@ describeDb("DELETE /api/account", () => {
       // Apple saw the decrypted refresh token.
       expect(d.revoked).toEqual([REFRESH_TOKEN]);
 
-      // The attributed source's canonical blob and staged upload are gone;
-      // the past-window and other-user sources were never touched.
-      expect(r2.deleted).toEqual([`poses/${SOURCE_ID}.tkp1.gz`, `staging/${SOURCE_ID}.tkp1.gz`]);
+      // Both attributed sources' canonical blobs and staged uploads are
+      // gone, the 40-day-old one included (attribution is kept until
+      // deletion, §1.2.17); the other user's source was never touched.
+      expect(r2.deleted.toSorted()).toEqual([
+        `poses/${SOURCE_ID}.tkp1.gz`,
+        `poses/${OLD_SOURCE_ID}.tkp1.gz`,
+        `staging/${SOURCE_ID}.tkp1.gz`,
+        `staging/${OLD_SOURCE_ID}.tkp1.gz`,
+      ]);
 
       // Source rows, clips, labels, and attribution cascade; the user row
       // takes sessions and reports with it.
@@ -150,7 +158,7 @@ describeDb("DELETE /api/account", () => {
       const [clip] = await tx`SELECT id FROM clips WHERE id = ${CLIP_ID}::uuid`;
       expect(clip).toBeUndefined();
       const [old] = await tx`SELECT id FROM sources WHERE id = ${OLD_SOURCE_ID}`;
-      expect(old?.id).toBe(OLD_SOURCE_ID);
+      expect(old).toBeUndefined();
       const [other] = await tx`SELECT id FROM sources WHERE id = ${OTHER_SOURCE_ID}`;
       expect(other?.id).toBe(OTHER_SOURCE_ID);
       const [user] = await tx`SELECT id FROM users WHERE id = ${USER_ID}`;
@@ -161,6 +169,8 @@ describeDb("DELETE /api/account", () => {
       expect(sessions).toEqual([]);
       const reports = await tx`SELECT id FROM reports WHERE reporter_user_id = ${USER_ID}`;
       expect(reports).toEqual([]);
+      const consents = await tx`SELECT disclosure_version FROM consents WHERE user_id = ${USER_ID}`;
+      expect(consents).toEqual([]);
     }));
 
   test("Apple unreachable → 503 APPLE_UNAVAILABLE with nothing deleted", async () =>
@@ -231,5 +241,68 @@ describeDb("DELETE /api/account", () => {
       expect((await handleDeleteAccount(del(authed(token)), d)).status).toBe(204);
       const retry = await handleDeleteAccount(del(authed(token)), d);
       expect(retry.status).toBe(401);
+    }));
+});
+
+describeDb("deleteIdleAccounts (§1.2.17)", () => {
+  const idleFor = (tx: SQL, userId: string, months: number, days = 0) =>
+    tx`UPDATE users
+      SET last_active_at = now() - make_interval(months => ${months}::int, days => ${days}::int)
+      WHERE id = ${userId}`;
+
+  test("deletes an account idle past 24 months through the DELETE /api/account steps, keeps one inside", async () =>
+    inRollback(sharedSql, async (tx) => {
+      expect(IDLE_ACCOUNT_MONTHS).toBe(24);
+      const { refreshKey } = await seedUser(tx, USER_ID);
+      await seedUser(tx, OTHER_USER, { refreshToken: false });
+      await seedSource(tx, SOURCE_ID, USER_ID, true);
+      await seedSource(tx, OTHER_SOURCE_ID, OTHER_USER);
+      await idleFor(tx, USER_ID, 24, 1);
+      await idleFor(tx, OTHER_USER, 23, 27);
+
+      const r2 = fakeR2();
+      const d = deps(tx, refreshKey, r2);
+      expect(await deleteIdleAccounts(d)).toEqual({ deleted: 1, failed: 0 });
+
+      expect(d.revoked).toEqual([REFRESH_TOKEN]);
+      expect(r2.deleted).toEqual([`poses/${SOURCE_ID}.tkp1.gz`, `staging/${SOURCE_ID}.tkp1.gz`]);
+      expect(await tx`SELECT id FROM users WHERE id = ${USER_ID}`).toHaveLength(0);
+      expect(await tx`SELECT id FROM sources WHERE id = ${SOURCE_ID}`).toHaveLength(0);
+      const [kept] = await tx`SELECT id FROM users WHERE id = ${OTHER_USER}`;
+      expect(kept?.id).toBe(OTHER_USER);
+      const [keptSource] = await tx`SELECT id FROM sources WHERE id = ${OTHER_SOURCE_ID}`;
+      expect(keptSource?.id).toBe(OTHER_SOURCE_ID);
+    }));
+
+  test("Apple unreachable → counted as failed, nothing deleted, retried next run", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const { refreshKey } = await seedUser(tx, USER_ID);
+      await seedSource(tx, SOURCE_ID, USER_ID);
+      await idleFor(tx, USER_ID, 25);
+      const r2 = fakeR2();
+      const d = deps(tx, refreshKey, r2, { revoke: () => Promise.reject(new AppleUnavailableError("down")) });
+      expect(await deleteIdleAccounts(d)).toEqual({ deleted: 0, failed: 1 });
+      expect(r2.deleted).toEqual([]);
+      const [user] = await tx`SELECT id FROM users WHERE id = ${USER_ID}`;
+      expect(user?.id).toBe(USER_ID);
+    }));
+
+  test("an authenticated request moves last_active_at forward, at most hourly", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const { token, refreshKey } = await seedUser(tx, USER_ID, { refreshToken: false });
+      await idleFor(tx, USER_ID, 25);
+      const req = del(authed(token));
+      expect(await authenticateClient(req, { sql: tx })).toEqual({ userId: USER_ID });
+      const [{ fresh }] = await tx`
+        SELECT last_active_at > now() - interval '1 minute' AS fresh FROM users WHERE id = ${USER_ID}`;
+      expect(fresh).toBe(true);
+      expect(await deleteIdleAccounts(deps(tx, refreshKey, fakeR2()))).toEqual({ deleted: 0, failed: 0 });
+
+      // Within the hour, no further write.
+      await tx`UPDATE users SET last_active_at = now() - interval '30 minutes' WHERE id = ${USER_ID}`;
+      await authenticateClient(req, { sql: tx });
+      const [{ unchanged }] = await tx`
+        SELECT last_active_at = now() - interval '30 minutes' AS unchanged FROM users WHERE id = ${USER_ID}`;
+      expect(unchanged).toBe(true);
     }));
 });
