@@ -257,4 +257,24 @@ describeDb("segment lifecycle", () => {
       const [{ dirty }] = await tx`SELECT segments_dirty_at IS NOT NULL AS dirty FROM sources`;
       expect(dirty).toBe(true);
     }));
+
+  test("a segment copies its clip's provenance, quoting suggested names safely", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const bucket = memoryBucket();
+      await seed(tx, bucket);
+      await tx`INSERT INTO models (version, taxonomy_version, r2_key, sha256)
+        VALUES ('trick-v1', 1, 'models/v1.zip', ${"0".repeat(64)})`;
+      await tx`UPDATE clips SET proposal_model_version = 'trick-v1',
+        suggested_names = ARRAY['cork', 'say "hi"', 'back\\slash', 'a,b'], suggestions_withheld = true
+        WHERE id = ${clipId(1)}::uuid`;
+      await segmentDirtySources({ sql: tx, store: bucket.store });
+      const [row] = await tx`
+        SELECT proposal_model_version, suggested_names, suggestions_withheld FROM training_segments
+        WHERE window_end - window_start = 20`;
+      expect(row).toEqual({
+        proposal_model_version: "trick-v1",
+        suggested_names: ["cork", 'say "hi"', "back\\slash", "a,b"],
+        suggestions_withheld: true,
+      });
+    }));
 });
