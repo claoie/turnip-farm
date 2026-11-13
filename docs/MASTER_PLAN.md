@@ -384,9 +384,10 @@ match.
 - `POST /api/models` — training pipeline publishes the champion
   (admin-scoped), with its `name_metrics` and the ids of the sources it
   trained on.
-- `GET /api/labels/export?since=` — training pipeline pull: labels +
-  provenance + pose blob references since a watermark. **Excludes
-  quarantined sources.**
+- `GET /api/labels/export?since=` — training pipeline pull: training
+  segments (short, re-targeted windows around labeled clips, never
+  whole-session pose) with their labels and provenance. **Excludes
+  quarantined sources.** (`BACKEND_DESIGN.md` §1.2.24, §7.3.)
 - `POST /api/reports` — report a bad label/clip.
 
 Dropped from the Rev 1 draft: `GET /api/labels/pending` — there is no
@@ -473,12 +474,19 @@ draft clips).
 - Training target: one segment per confirmed clip window; combo clips
   carry their N canonical names on the single window.
 
-**Data.** `GET /api/labels/export?since=` → (pose blob, clip windows,
-free-text labels). Curation: normalize raw strings to canonical names
+**Data.** `GET /api/labels/export` → training segments
+(`BACKEND_DESIGN.md` §1.2.24, `POSE_FORMAT.md` §12): per labeled clip,
+a short `TKS1` window with context, re-targeted onto a standard body
+(13 joints in torso lengths, one head point, light noise), its clip
+window, a `split_bucket` for leakage-free splits, labels and provenance.
+Whole-session pose is never exported (privacy plan, 2026-11). Two
+consequences for training: background negatives come only from the
+context frames around each clip, and the on-device model must apply the
+same re-targeting (without the noise) to its input, since it no longer
+trains on raw `TKP1`. Curation: normalize raw strings to canonical names
 via `label_taxonomy` (a combo string like
 `"hook - scoot - gainer - cartfull (combo)"` splits into four canonical
-labels on one window); raw strings never discarded. Non-labeled regions
-of contributed sources serve as background negatives. The Profile's
+labels on one window); raw strings never discarded. The Profile's
 achievements will pull contributions toward popular tricks, so training
 samples classes in balance rather than in proportion to how often they
 are labeled.

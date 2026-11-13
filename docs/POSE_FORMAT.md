@@ -5,9 +5,11 @@ format, the canonical encoding for pose keypoint sequences defined by the
 master plan
 (`https://github.com/hoiekim/turnip-farm/blob/main/docs/MASTER_PLAN.md`,
 §3). It is used on the wire (client → farm pose-blob upload) and at rest
-(R2 pose blobs). It is the *only* pose representation the farm accepts or
-stores — no JSON variant. Implementers should be able to write a conformant
-encoder and decoder from this document plus the test vectors in §11 alone.
+(R2 pose blobs). It is the *only* pose representation the farm accepts —
+no JSON variant. The farm also stores and exports training segments in
+a derived format, `TKS1`, specified in §12. Implementers should be able
+to write a conformant encoder and decoder from this document plus the
+test vectors in §11 alone.
 
 **Conventions.** All multi-byte integers and floats are **little-endian**.
 "**MUST**" / "**MUST NOT**" are conformance requirements (§10).
@@ -290,3 +292,114 @@ Canonical `frame_count = floor(((5 - 1) / 24) * 10) + 1 = 2`.
   canonical nose x = `0.6 * 0.50 + 0.4 * 0.55 = 0.52`.
 - If `S[3]` were a gap frame, canonical frame 1 MUST be a gap
   (gaps break interpolation, §6) — not `0.6 * S[2]`.
+
+## 12. Training segments (`TKS1`)
+
+The farm keeps whole-session `TKP1` blobs only while the contributing
+account exists, and never exports them. What it exports for training is
+**segments**: short windows cut around each confirmed clip, re-targeted
+onto a standard body (`BACKEND_DESIGN.md` §1.2.24). A segment blob is a
+separate format, `TKS1`, because its keypoint set differs from `TKP1`'s
+(§9). It is written only by the farm and read only by the training
+pipeline. Files are named `segments/<segment_id>.tks1.gz`, where
+`segment_id` is a random UUIDv4 with no relation to the source.
+
+### 12.1 Layout
+
+The same shape as `TKP1` (§2–§3): a 24-byte header, then a dense
+`[frame][joint][channel]` float32 array, little-endian, the whole blob
+gzipped as one member. Total size `24 + frame_count × 156` bytes.
+
+| Offset | Size | Type    | Field            | Value / constraint                     |
+|--------|------|---------|------------------|----------------------------------------|
+| 0      | 4    | char[4] | `magic`          | ASCII `"TKS1"` (`0x54 0x4B 0x53 0x31`) |
+| 4      | 2    | u16     | `format_version` | `1`                                    |
+| 6      | 2    | u16     | `keypoint_count` | `13`                                   |
+| 8      | 4    | u32     | `frame_count`    | `>= 1`                                 |
+| 12     | 4    | f32     | `sample_rate_hz` | `10.0`                                 |
+| 16     | 8    | —       | reserved         | MUST be zero (no source rate, no flags) |
+
+Byte offset of joint `k` (0–12), channel `c` (0 = x, 1 = y,
+2 = confidence) in frame `f`:
+
+```
+offset = 24 + ((f * 13 + k) * 3 + c) * 4
+```
+
+### 12.2 Joints
+
+| Index | Joint          | From `TKP1`                  |
+|-------|----------------|------------------------------|
+| 0     | head           | mean of the detected keypoints 0–4 |
+| 1     | left_shoulder  | 5                            |
+| 2     | right_shoulder | 6                            |
+| 3     | left_elbow     | 7                            |
+| 4     | right_elbow    | 8                            |
+| 5     | left_wrist     | 9                            |
+| 6     | right_wrist    | 10                           |
+| 7     | left_hip       | 11                           |
+| 8     | right_hip      | 12                           |
+| 9     | left_knee      | 13                           |
+| 10    | right_knee     | 14                           |
+| 11    | left_ankle     | 15                           |
+| 12    | right_ankle    | 16                           |
+
+### 12.3 Coordinates
+
+Segment coordinates are not image coordinates. They are in **torso
+lengths** in a body-centered frame, with the same axis directions as
+`TKP1` (x right, y down in the original picture):
+
+- The **root** is the hip midpoint (`TKP1` 11 and 12). Root positions
+  are centered on their mean over the segment and divided by the
+  segment's median torso length (hip midpoint to shoulder midpoint, in
+  `TKP1` units). Root motion, such as a jump, survives; the subject's
+  place in the picture does not. The root itself is not stored; it is
+  the midpoint of joints 7 and 8.
+- Every other joint is placed from its parent along the **observed bone
+  direction** at the **standard bone length**, so joint angles survive
+  and limb proportions do not. Parents: hips from the root; the shoulder
+  midpoint from the root; shoulders and the head from the shoulder
+  midpoint; elbows from shoulders, wrists from elbows; knees from hips,
+  ankles from knees. Standard lengths, in torso lengths:
+
+  | Bone                          | Length |
+  |-------------------------------|--------|
+  | root → shoulder midpoint      | 1.00   |
+  | root → each hip               | 0.20   |
+  | shoulder midpoint → each shoulder | 0.35 |
+  | shoulder midpoint → head      | 0.45   |
+  | shoulder → elbow              | 0.55   |
+  | elbow → wrist                 | 0.50   |
+  | hip → knee                    | 0.85   |
+  | knee → ankle                  | 0.80   |
+
+- Independent Gaussian noise with standard deviation **0.02** torso
+  lengths is added to each stored joint's x and y.
+- `confidence` is the observed `TKP1` confidence of the joint (for the
+  head, the mean over the keypoints 0–4 it used), never noised.
+
+### 12.4 Missing data
+
+- A joint is missing ⟺ its confidence is `0.0f`; its three floats are
+  then all `0.0f`. A joint is missing when it was not detected, when its
+  parent is missing, or when it coincides with its parent.
+- A frame missing either hip has no root, so all 13 joints are missing:
+  a **gap frame** (156 zero bytes), as in §7.
+- Decoders MUST treat missing joints and gap frames as missing data and
+  never interpolate across them.
+
+### 12.5 Decoder conformance
+
+A decoder MUST reject a blob whose `magic != "TKS1"`,
+`format_version != 1`, `keypoint_count != 13`,
+`sample_rate_hz != 10.0`, any nonzero reserved byte, or whose length
+after gunzip is not `24 + frame_count × 156`.
+
+### 12.6 What a segment omits
+
+A segment carries no source id, video id, account, timestamp, capture
+rate, image position or limb proportions. The farm cuts at most one
+segment per clip and keeps no two segments of a source that overlap or
+lie within 1 second of each other, so a session can't be stitched back
+together from its segments (`BACKEND_DESIGN.md` §1.2.24).

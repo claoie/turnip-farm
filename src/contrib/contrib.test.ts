@@ -273,9 +273,13 @@ describeDb("POST /api/clips", () => {
       const hex = createHash("sha256").update(blob).digest("hex");
       const d = deps(tx, fakeR2({ bytes: blob }));
       await seedIngestedSource(tx, token, hex);
+      await tx`UPDATE sources SET segments_dirty_at = NULL WHERE id = ${VIDEO_ID}`;
 
       const res = await handlePostClips(post("/api/clips", clipBody(), authed(token)), d);
       expect(res.status).toBe(200);
+      // The source's training segments need cutting again (§1.2.24).
+      const [{ dirty }] = await tx`SELECT segments_dirty_at IS NOT NULL AS dirty FROM sources WHERE id = ${VIDEO_ID}`;
+      expect(dirty).toBe(true);
       const body = await bodyJson(res);
       expect(body.clips).toHaveLength(1);
       expect(body.clips[0].clip_id).toBe(CLIP_ID);
@@ -468,6 +472,7 @@ describeDb("POST /api/clips/:id/labels", () => {
       expect(reg.status).toBe(201);
       await tx`UPDATE sources SET sha256 = ${hex} WHERE id = ${VIDEO_ID}`;
       await tx`INSERT INTO clips (id, source_id, start_frame, end_frame) VALUES (${CLIP_ID}, ${VIDEO_ID}, 1, 2)`;
+      await tx`UPDATE sources SET segments_dirty_at = NULL WHERE id = ${VIDEO_ID}`;
 
       const labels = [
         { name: "hook", origin: "vocabulary" },
@@ -487,6 +492,8 @@ describeDb("POST /api/clips/:id/labels", () => {
       });
       const [stored] = await tx`SELECT trick_name, origin FROM labels WHERE clip_id = ${CLIP_ID}`;
       expect([stored.trick_name, stored.origin]).toEqual(["Hook", "typed"]);
+      const [{ dirty }] = await tx`SELECT segments_dirty_at IS NOT NULL AS dirty FROM sources WHERE id = ${VIDEO_ID}`;
+      expect(dirty).toBe(true);
 
       // Labels answer to the clip's stored provenance: this one has no proposing model.
       const kept = { source_key: SOURCE_KEY, labels: [{ name: "cork", origin: "model" }] };

@@ -70,7 +70,10 @@ export function createPostgresSourceStore(sql: SQL): SourceStore {
     // upsert deliberately never overwrites sha256 (§1.2.10), and
     // updated_at is set explicitly — no triggers (§1.2.11).
     async setSha256(id, sha256) {
-      const result = await sql`UPDATE sources SET sha256 = ${sha256}, updated_at = now() WHERE id = ${id}`;
+      // A new blob means new segments (§1.2.24).
+      const result = await sql`
+        UPDATE sources SET sha256 = ${sha256}, updated_at = now(), segments_dirty_at = now()
+        WHERE id = ${id}`;
       if (result.count !== 1) throw new IngestError("source-vanished", id);
     },
   };

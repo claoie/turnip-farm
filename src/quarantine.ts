@@ -22,6 +22,8 @@ import { authenticatePipeline, type PipelineDeps } from "./pipeline";
 import { isVideoId, readJsonObject } from "./contrib/validate";
 import type { R2Client } from "./r2/client";
 import { stagingKeyFor } from "./r2/keys";
+import { deleteLinkedSegmentRows, linkedSegmentKeys } from "./ingest/segmenter";
+import { deleteSegmentBlobsAfterCommit } from "./contrib/sources";
 
 export interface QuarantineDeps extends PipelineDeps {
   r2: R2Client;
@@ -133,13 +135,17 @@ export async function handlePurgeQuarantine(
 
   // R2 first, then the row (the DELETE /api/sources/:id order): if either
   // delete throws, the source row survives so the call can be retried.
+  // Poisoned data leaves training, so its linked segments go too (§1.2.24).
+  const segmentKeys = await linkedSegmentKeys(deps.sql, sourceId);
   try {
     await deps.r2.deleteObject(source.r2_key as string);
     await deps.r2.deleteObject(stagingKeyFor(sourceId));
+    for (const key of segmentKeys) await deps.r2.deleteObject(key);
   } catch {
     return errorResponse(500, "INTERNAL", "Could not delete the stored blob; retry later");
   }
-  await transaction(deps.sql, async (tx) => {
+  const lateKeys = await transaction(deps.sql, async (tx) => {
+    const keys = await deleteLinkedSegmentRows(tx, sourceId);
     // The purge transition, then the hard delete (§1.2.3): the source row
     // is gone entirely, and the quarantine row cascades with it — a purged
     // source has nothing left to exclude.
@@ -148,6 +154,8 @@ export async function handlePurgeQuarantine(
       SET resolved_at = now(), resolution = 'purged'
       WHERE source_id = ${sourceId} AND resolved_at IS NULL`;
     await tx`DELETE FROM sources WHERE id = ${sourceId}`;
+    return keys.filter((k) => !segmentKeys.includes(k));
   });
+  await deleteSegmentBlobsAfterCommit(deps.r2, lateKeys);
   return new Response(null, { status: 204 });
 }

@@ -130,6 +130,11 @@ async function recordAttribution(tx: SQL, sourceId: string, userId: string): Pro
       attributed_at = now()`;
 }
 
+// The source's training segments need cutting again (§1.2.24).
+async function markSegmentsDirty(tx: SQL, sourceId: string): Promise<void> {
+  await tx`UPDATE sources SET segments_dirty_at = now() WHERE id = ${sourceId}`;
+}
+
 // POST /api/clips — batch upsert clips + replace their label sets (§7.3).
 export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Response> {
   const auth = await authenticateClient(req, deps);
@@ -257,6 +262,7 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
     // 6. Attribution for each distinct source (§4).
     for (const sourceId of sources.keys()) {
       await recordAttribution(tx, sourceId, auth.userId);
+      await markSegmentsDirty(tx, sourceId);
     }
     return {
       status: 200 as const,
@@ -301,6 +307,7 @@ export async function handlePostClipLabels(
     const taxonomyVersion = tax.v as number;
     await replaceLabelSet(tx, clipId, labels, taxonomyVersion);
     await recordAttribution(tx, clip.source_id as string, auth.userId);
+    await markSegmentsDirty(tx, clip.source_id as string);
     return { status: 200 as const, clip_id: clipId, labels, taxonomy_version: taxonomyVersion };
   });
 

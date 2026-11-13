@@ -90,6 +90,19 @@ describe("validatePublishInput", () => {
     expect(i.trainingSourceIds).toEqual([]);
   });
 
+  test("validates and dedupes training_segment_ids", () => {
+    const id = "123e4567-e89b-42d3-a456-426614170001";
+    const { input } = validatePublishInput({ ...validBody(), training_segment_ids: [id, id.toUpperCase()] });
+    expect(input!.trainingSegmentIds).toEqual([id]);
+    expect(validatePublishInput(validBody()).input!.trainingSegmentIds).toEqual([]);
+    expect(validatePublishInput({ ...validBody(), training_segment_ids: ["nope"] }).error).toBe(
+      "training_segment_ids must be segment uuids",
+    );
+    expect(validatePublishInput({ ...validBody(), training_segment_ids: id }).error).toBe(
+      "training_segment_ids must be an array",
+    );
+  });
+
   test("dedupes training_source_ids", () => {
     const id = "d".repeat(64);
     const { input } = validatePublishInput({ ...validBody(), training_source_ids: [id, id] });
@@ -316,6 +329,37 @@ describe.skipIf(!TEST_DATABASE_URL)("model registry, DB-backed", () => {
       );
       expect(res.status).toBe(201);
       expect(((await res.json()) as Record<string, unknown>).training_sources_recorded).toBe(0);
+    });
+  });
+
+  test("training_segment_ids record the sources the segments are still linked to", async () => {
+    await inRollback(sql, async (tx) => {
+      const d: ModelsDeps = { sql: tx, pipelineKey: PIPELINE_KEY, r2: stubR2 };
+      await tx`
+        INSERT INTO sources (id, source_key_hash, frame_count, sample_rate, r2_key)
+        VALUES (${SOURCE_ID}, ${"f".repeat(64)}, 600, 30, ${`poses/${SOURCE_ID}.tkp1.gz`})`;
+      const linked = "123e4567-e89b-42d3-a456-426614170001";
+      const delinked = "123e4567-e89b-42d3-a456-426614170002";
+      for (const id of [linked, delinked]) {
+        await tx`INSERT INTO training_segments (id, r2_key, sha256, frame_count, window_start, window_end, split_bucket)
+          VALUES (${id}::uuid, ${`segments/${id}.tks1.gz`}, ${"0".repeat(64)}, 20, 5, 15, 0)`;
+      }
+      await tx`INSERT INTO segment_sources (segment_id, source_id) VALUES (${linked}::uuid, ${SOURCE_ID})`;
+
+      const res = await handlePostModels(
+        postReq({
+          ...validBody(),
+          version: "trick-v1.4",
+          training_source_ids: [],
+          training_segment_ids: [linked, delinked, "123e4567-e89b-42d3-a456-426614170003"],
+        }),
+        d,
+      );
+      expect(res.status).toBe(201);
+      expect(((await res.json()) as Record<string, unknown>).training_sources_recorded).toBe(1);
+      const membership = await tx`
+        SELECT source_id FROM model_training_sources WHERE model_version = 'trick-v1.4'`;
+      expect(membership.map((r: { source_id: string }) => r.source_id)).toEqual([SOURCE_ID]);
     });
   });
 });

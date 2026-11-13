@@ -8,6 +8,7 @@ import { deleteIdleAccounts } from "./auth/account";
 import { purgeExpiredAttribution } from "./contrib/purge";
 import { R2BlobStore } from "./ingest/store";
 import { createPostgresSourceStore, startIngestPoller } from "./ingest/worker";
+import { startSegmenter } from "./ingest/segmenter";
 import { createR2Client } from "./r2/client";
 import { TokenBucket } from "./ratelimit";
 
@@ -100,12 +101,14 @@ console.log(`turnip-farm listening on ${server.url}`);
 // 0 disables (e.g. when R2 event notifications drive ingest instead).
 const ingestIntervalMs = parseIngestIntervalMs(process.env.INGEST_POLL_INTERVAL_MS);
 let stopIngest: (() => void) | undefined;
+let stopSegmenter: (() => void) | undefined;
 if (ingestIntervalMs > 0) {
-  stopIngest = startIngestPoller(
-    { store: new R2BlobStore(config.r2), sources: createPostgresSourceStore(sql) },
-    ingestIntervalMs,
-  );
-  console.log(`ingest poller running every ${ingestIntervalMs}ms`);
+  const store = new R2BlobStore(config.r2);
+  stopIngest = startIngestPoller({ store, sources: createPostgresSourceStore(sql) }, ingestIntervalMs);
+  // Training segments are cut from stored blobs once clips arrive
+  // (BACKEND_DESIGN.md §1.2.24), on the same interval.
+  stopSegmenter = startSegmenter({ sql, store }, ingestIntervalMs);
+  console.log(`ingest poller and segmenter running every ${ingestIntervalMs}ms`);
 }
 
 // Graceful shutdown on SIGTERM, which `docker stop` and `systemctl restart`
@@ -119,6 +122,7 @@ process.on("SIGTERM", async () => {
   console.log("turnip-farm shutting down");
   clearInterval(retentionTimer);
   stopIngest?.();
+  stopSegmenter?.();
   await server.stop();
   await sql.end();
   process.exit(0);

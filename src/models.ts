@@ -16,7 +16,7 @@
 import { errorResponse } from "./errors";
 import { transaction } from "./db";
 import { authenticatePipeline, type PipelineDeps } from "./pipeline";
-import { isVideoId, readJsonObject } from "./contrib/validate";
+import { isUuid, isVideoId, readJsonObject } from "./contrib/validate";
 import type { R2Client } from "./r2/client";
 import { buildVocabulary } from "./taxonomy";
 
@@ -48,6 +48,8 @@ export interface PublishInput {
   valMetrics: Record<string, unknown>;
   nameMetrics: Record<string, unknown>;
   trainingSourceIds: string[];
+  /** Training segments (§1.2.24); recorded as the sources they are still linked to. */
+  trainingSegmentIds: string[];
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
@@ -76,6 +78,7 @@ export function validatePublishInput(body: unknown): {
     val_metrics: valMetrics,
     name_metrics: nameMetrics,
     training_source_ids: trainingSourceIds,
+    training_segment_ids: trainingSegmentIds,
   } = body;
 
   if (typeof version !== "string" || version.trim() === "" || version.length > MAX_VERSION_LEN) {
@@ -127,6 +130,16 @@ export function validatePublishInput(body: unknown): {
     }
     sourceIds = [...new Set(trainingSourceIds as string[])];
   }
+  let segmentIds: string[] = [];
+  if (trainingSegmentIds !== undefined) {
+    if (!Array.isArray(trainingSegmentIds) || trainingSegmentIds.length > MAX_SOURCE_IDS) {
+      return { error: "training_segment_ids must be an array" };
+    }
+    for (const id of trainingSegmentIds) {
+      if (!isUuid(id)) return { error: "training_segment_ids must be segment uuids" };
+    }
+    segmentIds = [...new Set((trainingSegmentIds as string[]).map((id) => id.toLowerCase()))];
+  }
 
   return {
     input: {
@@ -143,6 +156,7 @@ export function validatePublishInput(body: unknown): {
       valMetrics: (valMetrics as Record<string, unknown> | undefined) ?? {},
       nameMetrics: (nameMetrics as Record<string, unknown> | undefined) ?? {},
       trainingSourceIds: sourceIds,
+      trainingSegmentIds: segmentIds,
     },
   };
 }
@@ -183,10 +197,17 @@ export async function handlePostModels(req: Request, deps: ModelsDeps): Promise<
     // JS instead: every id here passed isVideoId (64-char lowercase hex) in
     // validatePublishInput, so the joined literal cannot inject.
     const idLiteral = `{${input.trainingSourceIds.join(",")}}`;
+    // Segment ids reach their sources through segment_sources (§1.2.24);
+    // a de-linked or re-cut segment matches nothing. Every id passed
+    // isUuid, so this literal cannot inject either.
+    const segmentLiteral = `{${input.trainingSegmentIds.join(",")}}`;
     const recorded = await tx`
       INSERT INTO model_training_sources (model_version, source_id)
       SELECT ${input.version}, s.id FROM sources s
       WHERE s.id = ANY(${idLiteral}::char(64)[])
+      UNION
+      SELECT ${input.version}, ss.source_id FROM segment_sources ss
+      WHERE ss.segment_id = ANY(${segmentLiteral}::uuid[])
       ON CONFLICT DO NOTHING
       RETURNING source_id`;
     return {

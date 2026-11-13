@@ -14,6 +14,7 @@ import { canonicalKeyFor, stagingKeyFor } from "../r2/keys";
 import type { R2Client } from "../r2/client";
 import type { RateLimits } from "../app";
 import { requireConsent } from "../consent";
+import { deleteLinkedSegmentRows, linkedSegmentKeys } from "../ingest/segmenter";
 import { refuseBlockedRegion } from "../region";
 import { isSourceKey, isVideoId, readJsonObject } from "./validate";
 
@@ -256,14 +257,34 @@ export async function handleDeleteSource(
     SELECT r2_key FROM sources
     WHERE id = ${sourceId} AND source_key_hash = ${keyHash}`;
   if (!source) return notFound();
+  // The owner asked for the data to go, so its training segments go too
+  // (§1.2.24).
+  const segmentKeys = await linkedSegmentKeys(deps.sql, sourceId);
   try {
     await deps.r2.deleteObject(source.r2_key as string);
     await deps.r2.deleteObject(stagingKeyFor(sourceId));
+    for (const key of segmentKeys) await deps.r2.deleteObject(key);
   } catch {
     return errorResponse(500, "INTERNAL", "Could not delete the stored blob; retry later");
   }
-  await transaction(deps.sql, async (tx) => {
+  const lateKeys = await transaction(deps.sql, async (tx) => {
+    const keys = await deleteLinkedSegmentRows(tx, sourceId);
     await tx`DELETE FROM sources WHERE id = ${sourceId}`;
+    return keys.filter((k) => !segmentKeys.includes(k));
   });
+  await deleteSegmentBlobsAfterCommit(deps.r2, lateKeys);
   return new Response(null, { status: 204 });
+}
+
+// Segments the segmenter committed between the key read and the row
+// delete: their rows are gone, so delete their blobs too. Best-effort,
+// since the response can't be retried once the source row is gone.
+export async function deleteSegmentBlobsAfterCommit(r2: R2Client, keys: readonly string[]): Promise<void> {
+  for (const key of keys) {
+    try {
+      await r2.deleteObject(key);
+    } catch (err) {
+      console.warn(`could not delete segment blob ${key}:`, err);
+    }
+  }
 }
