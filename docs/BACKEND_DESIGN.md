@@ -1221,6 +1221,16 @@ The hourly idle-account job runs the same three steps for accounts idle
 for 24 months (§1.2.17, §4), with `contributions=keep`, and so does the
 `account-deleted` notification (steps 2 and 3).
 
+**Why those keep the segments (maintainer decision, 2026-11).** A
+deletion request reaches the farm only from a user signed in with their
+Apple account; it is the only way the farm can tell whose data a
+request is about. When the Apple account is deleted, or the farm's
+account is deleted for inactivity, nobody is left who can make that
+request, and the de-linked segments carry nothing that would let the
+farm find one person's data. So they are kept, like any other de-linked
+segment, until someone asks to delete specific data with a reasonable
+way to identify it.
+
 #### `POST /api/consent` — record agreement to the contribution disclosure
 
 Session required. Request:
@@ -1296,7 +1306,8 @@ By `events.type`, for the user `events.sub`:
   sign in again, or delete the account.
 - `account-deleted` (the user deleted their Apple Account; Apple has
   invalidated all their tokens, and they can never sign in again to
-  delete their data): run `DELETE /api/account` steps 2 and 3.
+  delete their data): run `DELETE /api/account` steps 2 and 3. Training
+  segments stay, de-linked (§7.3 "Why those keep the segments").
 - `email-enabled`, `email-disabled`: ignored. These events carry an
   email address, which the farm never stores or logs.
 
@@ -1902,8 +1913,10 @@ checklist:
   token, its consents, its attribution, and the whole-session pose of
   every contribution attributed to it or still keyed on the device.
   "Also delete my contributions" (`?contributions=delete`) removes the
-  training segments cut from them too; otherwise those stay, de-linked. Accounts idle for 24 months are deleted the same way
-  (§1.2.17). The account's whole-session pose goes with it; its
+  training segments cut from them too; otherwise those stay, de-linked.
+  Accounts idle for 24 months, and accounts whose Apple account was
+  deleted, are deleted the same way and keep their de-linked segments
+  (§1.2.17, §7.3 "Why those keep the segments"). The account's whole-session pose goes with it; its
   training segments stay, de-linked (§1.2.24). Data deleted outright
   leaves the next training dataset, because training rebuilds from a
   full pull (§6).
