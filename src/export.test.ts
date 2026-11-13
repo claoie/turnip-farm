@@ -124,7 +124,15 @@ describeDb("GET /api/labels/export", () => {
       expect(body.segments).toEqual([]);
       expect(body.taxonomy).toContainEqual({ raw: "corkscrew", canonical: "cork", taxonomy_version: 1 });
       expect(body.next_cursor).toBeNull();
-      expect(Object.keys(body).sort()).toEqual(["next_cursor", "segments", "taxonomy"]);
+      expect(Object.keys(body).sort()).toEqual([
+        "contributor_minimum",
+        "next_cursor",
+        "segments",
+        "taxonomy",
+        "trick_contributors",
+      ]);
+      expect(body.trick_contributors).toEqual([]);
+      expect(body.contributor_minimum).toBe(5);
     });
   });
 
@@ -210,6 +218,43 @@ describeDb("GET /api/labels/export", () => {
       await seedSegment(tx, segId(1), { labels: [] });
       await seedSegment(tx, segId(2));
       expect(await pullAll(tx, 10)).toEqual([segId(2)]);
+    });
+  });
+
+  test("trick_contributors counts distinct attributed accounts per canonical trick", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      for (const u of ["u1", "u2", "u3"]) await tx`INSERT INTO users (id) VALUES (${u})`;
+      const attributed = async (ch: string, user: string) => {
+        await seedSource(tx, vid(ch));
+        await tx`INSERT INTO source_attribution (source_id, user_id) VALUES (${vid(ch)}, ${user})`;
+      };
+      await attributed("a", "u1");
+      await attributed("b", "u1");
+      await attributed("c", "u2");
+      await attributed("d", "u3");
+      // cork and its alias corkscrew are one canonical: u1 (twice) and u2 → 2.
+      await seedSegment(tx, segId(1), { sourceId: vid("a"), labels: [{ name: "cork" }, { name: "gainer" }] });
+      await seedSegment(tx, segId(2), { sourceId: vid("b"), labels: [{ name: "Corkscrew" }] });
+      await seedSegment(tx, segId(3), { sourceId: vid("c"), labels: [{ name: "cork" }] });
+      // u3's source is quarantined: it counts for nobody while it is.
+      await seedSegment(tx, segId(4), { sourceId: vid("d"), labels: [{ name: "hook" }] });
+      await tx`INSERT INTO data_quarantine (source_id, reason) VALUES (${vid("d")}, 'fixture regression')`;
+      // A de-linked segment's contributor is unknown; a name with no mapping counts as itself.
+      await seedSegment(tx, segId(5), { labels: [{ name: "cork" }, { name: "scoot" }] });
+      await seedSegment(tx, segId(6), { sourceId: vid("c"), labels: [{ name: "Legacy Name" }] });
+
+      const body = await pull(tx);
+      expect(body.trick_contributors).toEqual([
+        { canonical: "cork", contributors: 2 },
+        { canonical: "gainer", contributors: 1 },
+        { canonical: "legacy name", contributors: 1 },
+      ]);
+      expect(JSON.stringify(body.trick_contributors)).not.toContain("u1");
+
+      // A rename at a later version moves the count to the new canonical.
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version) VALUES
+        ('cork', 'corkscrew', 2), ('corkscrew', 'corkscrew', 2)`;
+      expect((await pull(tx)).trick_contributors[0]).toEqual({ canonical: "corkscrew", contributors: 2 });
     });
   });
 });

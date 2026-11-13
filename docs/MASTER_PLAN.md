@@ -486,7 +486,10 @@ Whole-session pose is never exported (privacy plan, 2026-11). Two
 consequences for training: background negatives come only from the
 context frames around each clip, and the on-device model must apply the
 same re-targeting (without the noise) to its input, since it no longer
-trains on raw `TKP1`. Curation: normalize raw strings to canonical names
+trains on raw `TKP1`. The export also counts distinct contributors
+per canonical trick, and training holds back a trick with fewer than
+the export's `contributor_minimum` (5), so a model never learns a trick
+from one or two people (`BACKEND_DESIGN.md` §1.2.27). Curation: normalize raw strings to canonical names
 via `label_taxonomy` (a combo string like
 `"hook - scoot - gainer - cartfull (combo)"` splits into four canonical
 labels on one window); raw strings never discarded. The Profile's

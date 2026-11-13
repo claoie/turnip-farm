@@ -20,6 +20,13 @@ export interface ExportDeps extends PipelineDeps {
 
 export const EXPORT_PAGE_LIMIT = 10000;
 
+/**
+ * The fewest distinct contributors a trick needs before turnip-ml trains
+ * on it (§1.2.27); exported so the pipeline reads it from one place.
+ * A judgment call.
+ */
+export const HOLD_BACK_MIN_CONTRIBUTORS = 5;
+
 /** Opaque cursor: base64url of the JSON array `[segment_id]`. */
 export function encodeCursor(segmentId: string): string {
   return Buffer.from(JSON.stringify([segmentId]), "utf8").toString("base64url");
@@ -102,6 +109,28 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
     FROM label_taxonomy
     ORDER BY taxonomy_version ASC, raw ASC`) as Record<string, any>[];
 
+  // Distinct contributing accounts per canonical trick (§1.2.27), for the
+  // pipeline's hold-back. Counted over exported segments still linked to
+  // an attributed source; a de-linked segment's contributor is unknown,
+  // so it counts for nobody. A raw name resolves through its
+  // greatest-version mapping; one with no mapping counts as itself.
+  const contributors = (await deps.sql`
+    WITH current_map AS (
+      SELECT DISTINCT ON (lower(raw)) lower(raw) AS raw, canonical
+      FROM label_taxonomy
+      ORDER BY lower(raw), taxonomy_version DESC
+    )
+    SELECT COALESCE(m.canonical, lower(l.trick_name)) AS canonical,
+           count(DISTINCT a.user_id)::int             AS contributors
+    FROM training_segment_labels l
+    JOIN segment_sources ss    ON ss.segment_id = l.segment_id
+    JOIN source_attribution a  ON a.source_id = ss.source_id
+    LEFT JOIN data_quarantine q ON q.source_id = ss.source_id AND q.resolved_at IS NULL
+    LEFT JOIN current_map m     ON m.raw = lower(l.trick_name)
+    WHERE q.id IS NULL
+    GROUP BY 1
+    ORDER BY 1`) as { canonical: string; contributors: number }[];
+
   const last = segments[segments.length - 1];
   return Response.json({
     segments: segments.map((s) => ({
@@ -122,6 +151,8 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
       canonical: t.canonical,
       taxonomy_version: t.taxonomy_version,
     })),
+    trick_contributors: contributors.map((c) => ({ canonical: c.canonical, contributors: c.contributors })),
+    contributor_minimum: HOLD_BACK_MIN_CONTRIBUTORS,
     // Non-null whenever segments is non-empty; null only on an empty page.
     next_cursor: last ? encodeCursor(last.segment_id as string) : null,
   });

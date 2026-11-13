@@ -304,6 +304,24 @@ Two departures from the master plan's label draft follow from this:
     alike, is rounded down to a multiple of 5 (`STATS_COUNT_STEP` in
     `src/stats.ts`, a judgment call): a day with 1–4 reads 0, and the
     totals move in steps of 5.
+27. **The export counts contributors per trick, for the hold-back.**
+    *Added 2026-11 by the privacy plan* (§8.1, §9 Q8). A model can
+    memorize a trick that only one or two people ever performed, and
+    every device receives the model, so turnip-ml holds back a trick
+    until enough people contributed it. Only the farm knows who
+    contributed, so the export carries `trick_contributors`: per
+    canonical trick, the number of distinct accounts whose exported
+    segments carry it. It is counted over segments still linked to an
+    attributed source, excluding quarantined sources; a de-linked
+    segment's contributor is unknown and counts for nobody, so the count
+    errs toward holding back. A raw name resolves through its
+    greatest-version taxonomy mapping, so aliases count once; a name with
+    no mapping (only labels from before §1.2.25) counts as itself,
+    lowercased. A trick absent from the list has no known contributor.
+    The export also carries `contributor_minimum`, the hold-back
+    threshold (`HOLD_BACK_MIN_CONTRIBUTORS` in `src/export.ts`, 5, a
+    judgment call), so the pipeline and the farm read one value. Counts
+    only: no account id leaves the farm.
 
 ## 2. Conventions
 
@@ -898,7 +916,25 @@ Notes:
   `suggestions_withheld`.
 - Canonicalization (`raw → canonical`) happens in the training job using
   the `taxonomy` block shipped with the export response (§7,
-  `GET /api/labels/export`), not in SQL.
+  `GET /api/labels/export`), not in SQL. The one exception is
+  `trick_contributors` (§1.2.27), which the farm has to count per
+  canonical because only it knows the accounts:
+
+```sql
+WITH current_map AS (
+  SELECT DISTINCT ON (lower(raw)) lower(raw) AS raw, canonical
+  FROM label_taxonomy ORDER BY lower(raw), taxonomy_version DESC
+)
+SELECT COALESCE(m.canonical, lower(l.trick_name)) AS canonical,
+       count(DISTINCT a.user_id) AS contributors
+FROM training_segment_labels l
+JOIN segment_sources ss    ON ss.segment_id = l.segment_id
+JOIN source_attribution a  ON a.source_id = ss.source_id
+LEFT JOIN data_quarantine q ON q.source_id = ss.source_id AND q.resolved_at IS NULL
+LEFT JOIN current_map m     ON m.raw = lower(l.trick_name)
+WHERE q.id IS NULL
+GROUP BY 1 ORDER BY 1;
+```
 
 ## 7. API
 
@@ -1704,6 +1740,11 @@ segment, segments of quarantined sources excluded, ordered by
   "taxonomy": [
     {"raw": "corkscrew", "canonical": "cork", "taxonomy_version": 3}
   ],
+  "trick_contributors": [
+    {"canonical": "cork", "contributors": 12},
+    {"canonical": "gainer", "contributors": 3}
+  ],
+  "contributor_minimum": 5,
   "next_cursor": "<opaque>"  // non-null when segments is non-empty; null only on an empty page
 }
 ```
@@ -1725,6 +1766,15 @@ Fields:
   the clip's provenance (§1.2.18).
 - `labels`: the clip's label set, sorted by `trick_name`, each with its
   `origin` and `taxonomy_version`. Never empty.
+- `trick_contributors` (whole-dataset, the same on every page, like
+  `taxonomy`): per canonical trick under the current taxonomy, sorted
+  by `canonical`, the number of distinct accounts whose exported,
+  non-quarantined segments carry it, counting only segments still
+  linked to an account (§1.2.27). A canonical absent from the list has
+  0 known contributors. A label name with no taxonomy mapping appears
+  as its lowercased self.
+- `contributor_minimum`: the hold-back threshold. turnip-ml trains a
+  trick only when its `contributors >= contributor_minimum` (§9 Q8).
 
 `taxonomy` carries the whole `label_taxonomy` table (`raw → canonical`
 per version), so the training job canonicalizes without a second call.
@@ -1906,7 +1956,9 @@ is in turnip-ios `CONTRIBUTION_DESIGN.md` §8.1.
    and confirmation that no pose sequences ship inside model artifacts.
    Owned by the training design. *Proposed (§8.1):* also no
    per-example embeddings in a model, and rare tricks held back until
-   enough people contribute them.
+   enough people contribute them. The farm's part of the hold-back is
+   built: the export's `trick_contributors` and `contributor_minimum`
+   (§1.2.27).
 9. **Residual linkage.** Unlinked contributions can still be matched
    against a public video of the person in them, and an imported
    file's `video_id` can be recomputed by anyone holding the file
