@@ -142,6 +142,35 @@ describeDb("POST /api/sources", () => {
     });
   });
 
+  test("403 REGION_UNAVAILABLE from a blocked country, before anything is written", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const d = deps(tx, fakeR2());
+      const token = await seedUser(tx, "u1");
+      const body = {
+        video_id: VIDEO_ID,
+        source_key: SOURCE_KEY,
+        frame_count: 600,
+        sample_rate: 10,
+        keypoint_format: "tkp1",
+      };
+      const refused = await handleRegisterSource(
+        post("/api/sources", body, authed(token, { "cf-ipcountry": "GB" })),
+        d,
+      );
+      await expectError(refused, 403, "REGION_UNAVAILABLE");
+      const [count] = await tx`SELECT count(*)::int AS n FROM sources`;
+      expect(count.n).toBe(0);
+      const [attr] = await tx`SELECT count(*)::int AS n FROM source_attribution`;
+      expect(attr.n).toBe(0);
+
+      const allowed = await handleRegisterSource(
+        post("/api/sources", body, authed(token, { "cf-ipcountry": "US" })),
+        d,
+      );
+      expect(allowed.status).toBe(201);
+    });
+  });
+
   test("422 on invalid fields; 422 UNSUPPORTED_FORMAT for other formats", async () => {
     await inRollback(sharedSql!, async (tx) => {
       const d = deps(tx, fakeR2());

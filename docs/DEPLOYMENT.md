@@ -29,6 +29,12 @@ These are decisions, not tasks. They land **before** the first deploy:
 2. Point DNS at it (Cloudflare): `A farm.example.com → <droplet ip>`.
    The exact hostname is the maintainer's call; `farm.example.com` below
    is a placeholder.
+   Keep the record proxied (orange cloud): the farm's country backstop
+   reads Cloudflare's `CF-IPCountry` header, which a DNS-only record
+   never carries (`BACKEND_DESIGN.md` §7.2). A proxied record also puts
+   Cloudflare's edge in front of Caddy, so add Cloudflare's published
+   IP ranges to `TRUSTED_PROXIES` (§2), or every client shares the
+   per-IP rate limit of the edge address it came through.
 3. Create a non-root deploy user, lock down SSH (key-only), enable
    `ufw` allowing 22, 80, 443.
 4. Create the service user and its layout (as root) — the systemd unit

@@ -880,7 +880,9 @@ for `users.apple_refresh_token`).
   {"error": {"code": "VALIDATION_ERROR", "message": "...", "details": {}}}
   ```
 
-  Codes: `UNAUTHENTICATED` (401), `ACCOUNT_BLOCKED` (403), `NOT_FOUND`
+  Codes: `UNAUTHENTICATED` (401), `ACCOUNT_BLOCKED` (403),
+  `REGION_UNAVAILABLE` (403: contribution is switched off in the
+  request's country, see "Country backstop" below), `NOT_FOUND`
   (404), `NO_MODEL` (404), `VALIDATION_ERROR` (422), `UNSUPPORTED_FORMAT` (422),
   `BLOB_MISSING` (422), `BLOB_DIGEST_MISMATCH` (422),
   `SOURCE_ALREADY_CLAIMED` (409), `VERSION_EXISTS` (409),
@@ -909,6 +911,17 @@ for `users.apple_refresh_token`).
   resource IDs are not usable as an ownership oracle. Registration is
   the one exception: a `video_id` already claimed under another key
   gets `409 SOURCE_ALREADY_CLAIMED`.
+- **Country backstop:** contribution is switched off in the EU 27,
+  Iceland, Liechtenstein, Norway and the UK (§8.1). The app hides it on
+  those storefronts; the farm refuses the contribution entry points
+  (`POST /api/sources` today, `POST /api/consent` once it lands) with
+  `403 REGION_UNAVAILABLE` when Cloudflare's `CF-IPCountry` header holds
+  one of those ISO 3166-1 alpha-2 codes (`src/region.ts`). The check
+  runs before authentication, so a refused request touches nothing. A
+  missing header passes: it is a backstop behind the app's check, and a
+  request that does not come through Cloudflare carries none. Cloudflare
+  sends the header only when the farm's DNS record is proxied
+  (DEPLOYMENT.md §1).
 - **Rate limiting:** per-user token bucket on POST endpoints
   (suggested: 60 requests/minute; `429 RATE_LIMITED` with
   `Retry-After`). `POST /api/auth/apple` has no user yet, so it is
@@ -1067,6 +1080,9 @@ Request:
   "keypoint_format": "tkp1"
 }
 ```
+
+Refused first with `403 REGION_UNAVAILABLE` from a country where
+contribution is off (§7.2 "Country backstop").
 
 Validation: `video_id` matches `^[0-9a-f]{64}$`; `source_key` is 43
 base64url characters (§7.2); `frame_count > 0`; `sample_rate` in
@@ -1562,13 +1578,16 @@ checklist:
   training dataset, because training rebuilds from a full pull (§6).
   Models already trained on it are treated as anonymous, pending the
   assessment in §9 Q8.
+- Contribution is switched off in the EU, EEA and UK: the app hides it
+  on those storefronts, and the farm refuses contribution from those
+  countries as a backstop (§7.2 "Country backstop").
 
 ### 8.1 Planned changes (privacy plan, 2026-11)
 
 The maintainer's privacy plan changes the farm before contribution goes
-live. None of this is built yet; until it is, the sections above
-describe the code. The app side is in turnip-ios
-`CONTRIBUTION_DESIGN.md` §8.1.
+live. Items move out of this list into the sections above as they are
+built; until then, the sections above describe the code. The app side
+is in turnip-ios `CONTRIBUTION_DESIGN.md` §8.1.
 
 - **Consent on the farm.** Each agreement is recorded with its account,
   time and disclosure version. Accounts that agreed to the 30-day wording
@@ -1589,7 +1608,6 @@ describe the code. The app side is in turnip-ios
   set is never published, and the farm commits publicly not to
   re-identify it.
 - **Public stats.** `/api/stats` rounds or suppresses small counts.
-- **EU and UK.** Contribution stays switched off there for now.
 
 ## 9. Open questions
 
