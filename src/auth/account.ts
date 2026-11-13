@@ -12,6 +12,7 @@ import { errorResponse } from "../errors";
 import type { R2Client } from "../r2/client";
 import { stagingKeyFor } from "../r2/keys";
 import { deleteSegmentBlobsAfterCommit } from "../contrib/sources";
+import { deleteAccountCandidates } from "../labels";
 import { AppleUnavailableError, type RevokeRefreshToken } from "./apple";
 import { authenticateClient } from "./sessions";
 import { decryptRefreshToken } from "./tokens";
@@ -22,7 +23,12 @@ export interface AccountDeps {
   // AES-256-GCM key for users.apple_refresh_token.
   refreshTokenKey: CryptoKey;
   revokeRefreshToken: RevokeRefreshToken;
+  /** HMAC key for label-candidate account hashes (§1.2.25). */
+  candidateKey: CryptoKey;
 }
+
+/** What steps 2–3 of account deletion need. */
+export type AccountDataDeps = Pick<AccountDeps, "sql" | "r2" | "candidateKey">;
 
 export interface AccountDeletionOptions {
   /**
@@ -88,7 +94,7 @@ export async function deleteAccount(
   }
 
   try {
-    await deleteAccountData(deps.sql, deps.r2, userId, opts);
+    await deleteAccountData(deps, userId, opts);
   } catch {
     return "blob-delete-failed";
   }
@@ -106,8 +112,7 @@ export async function deleteAccount(
 // opts.deleteSegments asks for them too (§1.2.24). Deleting the user row
 // cascades sessions, consents and reports (§3).
 export async function deleteAccountData(
-  sql: SQL,
-  r2: R2Client,
+  { sql, r2, candidateKey }: AccountDataDeps,
   userId: string,
   opts: AccountDeletionOptions = {},
 ): Promise<void> {
@@ -145,6 +150,7 @@ export async function deleteAccountData(
     await tx`
       DELETE FROM sources
       WHERE id IN (SELECT source_id FROM source_attribution WHERE user_id = ${userId})`;
+    await deleteAccountCandidates(tx, candidateKey, userId);
     await tx`DELETE FROM users WHERE id = ${userId}`;
     return late;
   });

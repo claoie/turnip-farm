@@ -32,7 +32,10 @@ and 2026-10-15 (4):
 1. **Community labeling with free-text trick names.** Users label their
    clips; labels are free-text, the UI prompts for the trick name, and a
    clip can carry multiple labels (e.g. a combo: `hook`, `scoot`,
-   `gainer`, `cartfull`).
+   `gainer`, `cartfull`). *Narrowed 2026-11 (privacy plan):* the farm
+   stores only vocabulary names; a typed name the vocabulary lacks
+   becomes a candidate that the maintainer can promote
+   (`BACKEND_DESIGN.md` §1.2.25).
 2. **Privacy-first farm: no video, ever.** Clips are never sent to the farm
    as video data. What leaves the device is an opaque video identifier plus
    the pose keypoint sequence. The iOS client matches server-side label data
@@ -241,7 +244,7 @@ on the server as training data; the client simply cannot relink them.
   (bool: the blind sample, §6), `created_at`, `updated_at`.
   Hierarchy: **Source → Clip → Label**, all one-to-many.
 - `labels` — one row per `(clip_id, trick_name)` (`BACKEND_DESIGN.md`
-  §1.1): `trick_name` (free text, **multiple per clip** as multiple
+  §1.1): `trick_name` (a vocabulary name, **multiple per clip** as multiple
   rows; re-submission replaces the clip's whole set), `origin` (`typed`
   | `vocabulary` | `model`: typed by hand, picked from the vocabulary,
   or kept from the model's suggestion), `taxonomy_version` (vocab in
@@ -251,7 +254,7 @@ on the server as training data; the client simply cannot relink them.
   rendering concern.
 - `label_taxonomy` — `raw` → `canonical` mapping, `taxonomy_version`
   (monotonic int, bumped when canonical names are added/changed),
-  `first_seen`. Free text is preserved forever; training consumes
+  `first_seen`. Raw names are preserved forever; training consumes
   canonical names. Seeded from standard tricking vocabulary. Renaming a
   canonical name remaps, at the new version, every raw string that
   pointed at the old canonical (the old canonical included) to the new

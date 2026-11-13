@@ -512,7 +512,7 @@ describeDb("POST /api/clips/:id/labels", () => {
       const bad = await handlePostClipLabels(
         post(
           `/api/clips/${CLIP_ID}/labels`,
-          { source_key: OTHER_KEY, labels: [{ name: "x", origin: "typed" }] },
+          { source_key: OTHER_KEY, labels: [{ name: "cork", origin: "typed" }] },
           authed(token),
         ),
         d,

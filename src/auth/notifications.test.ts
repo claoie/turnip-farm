@@ -9,7 +9,7 @@ import { TEST_DATABASE_URL, inRollback } from "../../db/testing";
 import type { R2Client } from "../r2/client";
 import { createAppleJwtVerifier, InvalidTokenError } from "./apple";
 import { handleAppleNotifications, type NotificationsDeps } from "./notifications";
-import { AUDIENCE, SUB, startMockApple, type MockApple } from "./testing";
+import { AUDIENCE, SUB, startMockApple, testCandidateKey, type MockApple } from "./testing";
 import { encryptRefreshToken, importRefreshTokenKey, sha256Hex } from "./tokens";
 
 const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
@@ -54,7 +54,7 @@ function fakeR2(opts: { failDelete?: boolean } = {}): R2Client & { deleted: stri
 }
 
 function deps(tx: SQL, r2: R2Client): NotificationsDeps {
-  return { sql: tx, r2, verifyNotificationPayload };
+  return { sql: tx, r2, verifyNotificationPayload, candidateKey: testCandidateKey };
 }
 
 const post = (body: unknown) =>
@@ -123,6 +123,7 @@ describeDb("POST /api/auth/apple/notifications", () => {
         const err = await handleAppleNotifications(post({ payload }), {
           sql: tx,
           r2: fakeR2(),
+          candidateKey: testCandidateKey,
           verifyNotificationPayload: verify,
         }).then(
           () => {

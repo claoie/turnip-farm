@@ -6,6 +6,7 @@ import { SQL, type TransactionSQL } from "bun";
 import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { TEST_DATABASE_URL, inRollback } from "../../db/testing";
 import { deleteAccountData, handleDeleteAccount } from "../auth/account";
+import { testCandidateKey } from "../auth/testing";
 import { sha256Hex } from "../auth/tokens";
 import { handleDeleteSource } from "../contrib/sources";
 import { handlePurgeQuarantine } from "../quarantine";
@@ -196,7 +197,7 @@ describeDb("segment lifecycle", () => {
       const kept = (await segments(tx)).map((r: any) => r.r2_key);
       expect(kept).toHaveLength(2);
 
-      await deleteAccountData(tx, bucket.r2, USER_ID);
+      await deleteAccountData({ sql: tx, r2: bucket.r2, candidateKey: testCandidateKey }, USER_ID);
 
       expect(await links(tx)).toHaveLength(0);
       expect(await tx`SELECT id FROM sources`).toHaveLength(0);
@@ -221,6 +222,7 @@ describeDb("segment lifecycle", () => {
         r2: bucket.r2,
         refreshTokenKey: {} as CryptoKey,
         revokeRefreshToken: async () => {},
+        candidateKey: testCandidateKey,
       };
       const del = (query: string) =>
         new Request(`http://farm.test/api/account${query}`, {
@@ -254,7 +256,13 @@ describeDb("segment lifecycle", () => {
           method: "DELETE",
           headers: { authorization: "Bearer session-for-u1" },
         }),
-        { sql: tx, r2: bucket.r2, refreshTokenKey: {} as CryptoKey, revokeRefreshToken: async () => {} },
+        {
+          sql: tx,
+          r2: bucket.r2,
+          refreshTokenKey: {} as CryptoKey,
+          revokeRefreshToken: async () => {},
+          candidateKey: testCandidateKey,
+        },
       );
       expect(res.status).toBe(204);
       for (const table of ["users", "sources", "source_attribution", "segment_sources"]) {

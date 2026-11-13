@@ -21,6 +21,8 @@ export interface NotificationsDeps {
   sql: SQL;
   r2: R2Client;
   verifyNotificationPayload: VerifyAppleJwt;
+  /** HMAC key for label-candidate account hashes (§1.2.25). */
+  candidateKey: CryptoKey;
 }
 
 export async function handleAppleNotifications(req: Request, deps: NotificationsDeps): Promise<Response> {
@@ -60,7 +62,7 @@ export async function handleAppleNotifications(req: Request, deps: Notifications
       // The user deleted their Apple Account and can never sign in again
       // to delete their data: run `DELETE /api/account` steps 2 and 3.
       try {
-        await deleteAccountData(deps.sql, deps.r2, event.sub);
+        await deleteAccountData(deps, event.sub);
       } catch {
         return errorResponse(500, "INTERNAL", "Could not delete the account data; retry later");
       }

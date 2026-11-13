@@ -9,6 +9,7 @@ import type { R2Client } from "../r2/client";
 import { AppleUnavailableError } from "./apple";
 import { IDLE_ACCOUNT_MONTHS, deleteIdleAccounts, handleDeleteAccount, type AccountDeps } from "./account";
 import { authenticateClient } from "./sessions";
+import { testCandidateKey } from "./testing";
 import { encryptRefreshToken, importRefreshTokenKey, sha256Hex } from "./tokens";
 
 const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
@@ -85,6 +86,7 @@ function deps(tx: SQL, refreshKey: CryptoKey, r2: R2Client, opts: DepsOpts = {})
     sql: tx,
     r2,
     refreshTokenKey: refreshKey,
+    candidateKey: testCandidateKey,
     revokeRefreshToken:
       opts.revoke ??
       (async (token: string) => {

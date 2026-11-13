@@ -4,6 +4,7 @@
 import type { SQL } from "bun";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { APPLE_ISSUER, type AppleCredentials } from "./apple";
+import { deriveCandidateKey } from "../labels";
 
 export const AUDIENCE = "kim.hoie.turnip";
 export const SUB = "001234.0123456789abcdef0123456789abcdef.0123";
@@ -136,3 +137,6 @@ export async function startMockApple() {
 }
 
 export type MockApple = Awaited<ReturnType<typeof startMockApple>>;
+
+// The label-candidate HMAC key (§1.2.25) for tests, derived from 32 zero bytes.
+export const testCandidateKey = await deriveCandidateKey(new Uint8Array(32));

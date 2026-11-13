@@ -6,6 +6,7 @@ import { importRefreshTokenKey } from "./auth/tokens";
 import { type Config, ConfigError, loadConfig } from "./config";
 import { deleteIdleAccounts } from "./auth/account";
 import { purgeExpiredAttribution } from "./contrib/purge";
+import { deriveCandidateKey } from "./labels";
 import { R2BlobStore } from "./ingest/store";
 import { createPostgresSourceStore, startIngestPoller } from "./ingest/worker";
 import { startSegmenter } from "./ingest/segmenter";
@@ -49,6 +50,7 @@ const appleCredentials = {
 const r2 = createR2Client(config.r2);
 const refreshTokenKey = await importRefreshTokenKey(config.apple.refreshTokenKey);
 const revokeRefreshToken = createAppleRevoker({ credentials: appleCredentials });
+const candidateKey = await deriveCandidateKey(config.apple.refreshTokenKey);
 
 // Retention jobs (§1.2.17, §4), at startup and hourly: the report purge
 // (and the 30-day attribution purge for accounts that only agreed to the
@@ -56,7 +58,7 @@ const revokeRefreshToken = createAppleRevoker({ credentials: appleCredentials })
 // logged, never fatal; the next run retries.
 const retention = async () => {
   await purgeExpiredAttribution(sql).catch((err) => console.error("retention purge failed:", err));
-  await deleteIdleAccounts({ sql, r2, refreshTokenKey, revokeRefreshToken })
+  await deleteIdleAccounts({ sql, r2, refreshTokenKey, revokeRefreshToken, candidateKey })
     .then(({ deleted, failed }) => {
       if (deleted > 0 || failed > 0) console.log(`idle accounts: ${deleted} deleted, ${failed} failed`);
     })
@@ -85,6 +87,7 @@ const server = startServer(config.port, {
   r2,
   pipelineKey: config.pipelineKey,
   currentDisclosureVersion: config.currentDisclosureVersion,
+  candidateKey,
   limits: {
     // §7.2 suggestions: 60/min per user on POSTs, 10/min per IP on sign-in
     // and notifications, 30/min per IP on the public GET endpoints.

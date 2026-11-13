@@ -14,6 +14,7 @@ import { sha256Hex } from "../auth/tokens";
 import { authenticateClient } from "../auth/sessions";
 import { transaction } from "../db";
 import { requireConsent } from "../consent";
+import { unknownLabelResponse, unknownNames, vocabulary } from "../labels";
 import { errorResponse } from "../errors";
 import {
   BlobTooLargeError,
@@ -151,6 +152,14 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
     const { clip, error } = readClipInput((body!.clips as unknown[])[i], i);
     if (error) return error;
     inputs.push(clip!);
+  }
+
+  // Only vocabulary names (§1.2.25): the first clip with an unknown name
+  // fails the batch, before anything is read or written.
+  const vocab = await vocabulary(deps.sql);
+  for (let i = 0; i < inputs.length; i++) {
+    const unknown = unknownNames(vocab, inputs[i]!.labels.map((l) => l.name));
+    if (unknown.length > 0) return unknownLabelResponse(unknown, { index: i });
   }
 
   // 1. Sources exist and keys match; existing clips stay on their source.
@@ -293,6 +302,8 @@ export async function handlePostClipLabels(
   const read = body!.labels === undefined ? { labels: [] } : readLabels(body!.labels);
   if ("error" in read) return invalid(`labels${read.path}: ${read.error}`, { field: `labels${read.path}` });
   const labels = read.labels;
+  const unknown = unknownNames(await vocabulary(deps.sql), labels.map((l) => l.name));
+  if (unknown.length > 0) return unknownLabelResponse(unknown);
 
   const out = await transaction(deps.sql, async (tx) => {
     const [clip] = await tx`

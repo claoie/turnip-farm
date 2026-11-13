@@ -1,7 +1,7 @@
 # turnip-farm
 
 Backend and training dataset for [Turnip](https://github.com/hoiekim/turnip-ios).
-The farm collects confirmed trick clips and free-text trick names from the
+The farm collects confirmed trick clips and vocabulary trick names from the
 iOS app, stores them against on-device pose keypoint sequences, and serves
 that dataset to the training pipeline. It never receives video: what leaves
 the device is an opaque video ID, the pose keypoints, and the user's
@@ -116,6 +116,7 @@ src/
   models.ts        the model registry: POST /api/models, GET /api/models/current
   reports.ts       POST /api/reports
   consent.ts       POST /api/consent and the consent gate on contribution writes (§7.3)
+  labels.ts        vocabulary-only labels, POST /api/labels/candidates, and the candidate scripts (§1.2.25)
   moderation.ts    attribution lookup and blocking, for the scripts below
   *.test.ts        tests (bun test), next to the code they cover
 scripts/           maintainer scripts, run with bun run (see Moderation)
@@ -201,6 +202,17 @@ outlive the account, such as alerts, issues, or notes (§8). Blocking stops new
 contributions at once and keeps the account's sessions, so it can still
 sign out and delete itself. To remove what the account already
 contributed, purge the quarantined sources.
+
+### Vocabulary candidates
+
+Label names the vocabulary lacks arrive as candidates
+(`POST /api/labels/candidates`, BACKEND_DESIGN.md §1.2.25) and expire
+after 30 days. Two scripts review and promote them:
+
+```sh
+bun run labels:candidates [--min N]            # names by distinct accounts
+bun run labels:promote <name> [<canonical>]    # add to the taxonomy at a new version
+```
 
 ### Configuration
 

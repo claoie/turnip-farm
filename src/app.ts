@@ -25,6 +25,7 @@ import {
 } from "./quarantine";
 import { handlePostReport } from "./reports";
 import { handlePostConsent } from "./consent";
+import { handlePostLabelCandidates } from "./labels";
 import { errorResponse } from "./errors";
 import { isVideoId } from "./contrib/validate";
 import type { R2Client } from "./r2/client";
@@ -53,6 +54,8 @@ export type AppDeps = SignInDeps & {
   revokeRefreshToken: RevokeRefreshToken;
   /** The disclosure version contribution requires (`CURRENT_DISCLOSURE_VERSION`, §7.3 POST /api/consent). */
   currentDisclosureVersion: number;
+  /** HMAC key for label-candidate account hashes (§1.2.25). */
+  candidateKey: CryptoKey;
 };
 
 export interface HandlerOptions {
@@ -144,6 +147,9 @@ export function createHandler(deps: AppDeps, opts: HandlerOptions = {}): (req: R
       if (seg[1] === "labels") {
         if (method === "GET" && seg.length === 3 && seg[2] === "export") {
           return handleGetLabelsExport(req, deps);
+        }
+        if (method === "POST" && seg.length === 3 && seg[2] === "candidates") {
+          return handlePostLabelCandidates(req, deps);
         }
       }
       if (seg[1] === "taxonomy") {

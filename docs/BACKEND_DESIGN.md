@@ -273,6 +273,29 @@ Two departures from the master plan's label draft follow from this:
     lengths, bucket count) are judgment calls, named in
     `src/ingest/segments.ts`. Logs never put a segment id next to a
     source id.
+25. **Labels come only from the vocabulary.** *Added 2026-11 by the
+    privacy plan* (§8.1). A free-text name is whatever the user typed,
+    which can be a name, a place or a joke about a friend; the farm has
+    no use for that next to a pose sequence. `POST /api/clips` and
+    `POST /api/clips/:id/labels` accept only names that match a `raw`
+    in `label_taxonomy`, case-insensitively and at any taxonomy version
+    (versions are append-only), and answer `422 UNKNOWN_LABEL` with the
+    unknown names otherwise. A name stays as the client cased it.
+    A name the vocabulary lacks goes to `POST /api/labels/candidates`
+    instead, into `label_candidates`:
+    - no account id is stored: each row carries `account_hash`, the
+      HMAC-SHA-256 of the account id under a key derived with HKDF from
+      `APPLE_REFRESH_TOKEN_KEY` (info `"turnip-farm label candidates
+      v1"`), so the maintainer can count distinct accounts per name and
+      one account counts once;
+    - a row is deleted 30 days after the account first submitted the name
+      (the hourly retention purge, §4), and with the account (§7.3);
+    - the maintainer reviews candidates with `bun run labels:candidates`
+      and promotes one with `bun run labels:promote <name> [<canonical>]`,
+      which adds the name to `label_taxonomy` at a new version and drops
+      its candidates. There is no HTTP admin route.
+    The 30-day expiry is a judgment call (`LABEL_CANDIDATE_TTL_DAYS` in
+    `src/labels.ts`). Labels already stored keep their names.
 
 ## 2. Conventions
 
@@ -396,6 +419,20 @@ CREATE INDEX source_attribution_attributed_at_idx
 CREATE INDEX sources_segments_dirty_idx ON sources (segments_dirty_at)
   WHERE segments_dirty_at IS NOT NULL;
 
+CREATE TABLE label_candidates (
+  name         TEXT NOT NULL
+               CHECK (name <> '' AND name = btrim(name) AND char_length(name) <= 64),
+  account_hash CHAR(64) NOT NULL CHECK (account_hash ~ '^[0-9a-f]{64}$'),
+  -- HMAC-SHA-256 of the account id under a server key (§1.2.25): counts
+  -- distinct accounts per name without storing the id.
+  submitted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  -- The account's first submission of the name; deleted 30 days after it.
+);
+CREATE UNIQUE INDEX label_candidates_name_account_uniq
+  ON label_candidates (lower(name), account_hash);
+CREATE INDEX label_candidates_account_hash_idx ON label_candidates (account_hash);
+CREATE INDEX label_candidates_submitted_at_idx ON label_candidates (submitted_at);
+
 CREATE TABLE training_segments (
   id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   r2_key                 TEXT NOT NULL UNIQUE,
@@ -465,8 +502,9 @@ CREATE TABLE labels (
   clip_id          UUID NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
   trick_name       TEXT NOT NULL
                    CHECK (trick_name <> '' AND trick_name = btrim(trick_name)),
-  -- Free text, stored trimmed and verbatim (casing preserved).
-  -- Canonicalization happens at training-curation time via label_taxonomy.
+  -- A label_taxonomy raw name (§1.2.25), stored trimmed and as the client
+  -- cased it. Canonicalization happens at training-curation time via
+  -- label_taxonomy.
   origin           TEXT NOT NULL DEFAULT 'typed'
                    CHECK (origin IN ('typed', 'vocabulary', 'model')),
   -- How this name was given (§1.2.18): typed by hand, picked from the
@@ -678,6 +716,7 @@ WHERE a.attributed_at < now() - interval '30 days'
   AND NOT EXISTS (SELECT 1 FROM consents c
                   WHERE c.user_id = a.user_id AND c.disclosure_version >= 3);
 DELETE FROM reports WHERE created_at < now() - interval '30 days';
+DELETE FROM label_candidates WHERE submitted_at < now() - make_interval(days => 30);
 ```
 
 Then accounts idle for 24 months are deleted, up to 100 per run, each
@@ -984,7 +1023,8 @@ for `users.apple_refresh_token`).
   request's country, see "Country backstop" below), `CONSENT_REQUIRED`
   (403: the account has not agreed to the current contribution
   disclosure, §7.3 `POST /api/consent`), `NOT_FOUND`
-  (404), `NO_MODEL` (404), `VALIDATION_ERROR` (422), `UNSUPPORTED_FORMAT` (422),
+  (404), `NO_MODEL` (404), `VALIDATION_ERROR` (422), `UNKNOWN_LABEL` (422:
+  a label name outside the vocabulary, §1.2.25), `UNSUPPORTED_FORMAT` (422),
   `BLOB_MISSING` (422), `BLOB_DIGEST_MISMATCH` (422),
   `SOURCE_ALREADY_CLAIMED` (409), `VERSION_EXISTS` (409),
   `RATE_LIMITED` (429), `INTERNAL` (500), `APPLE_UNAVAILABLE` (503:
@@ -1308,7 +1348,11 @@ Request:
 `proposal_model_version` (default `null`), `suggested_names` (default
 `[]`) and `suggestions_withheld` (default `false`) are the clip's
 provenance (§1.2.18). Each `labels` entry is an object; `origin` is
-required, one of `typed | vocabulary | model`.
+required, one of `typed | vocabulary | model`. Every `name` must be in
+the vocabulary (§1.2.25): the first clip with an unknown name fails the
+batch with `422 UNKNOWN_LABEL`, `details = {"index": <clip index>,
+"field": "labels", "names": ["<unknown>", ...]}`, after the other body
+checks and before any source is read.
 
 After the session and rate-limit checks, an account that has not agreed
 to the current disclosure gets `403 CONSENT_REQUIRED` (§7.3
@@ -1370,7 +1414,9 @@ Request:
 
 Behavior: `403 CONSENT_REQUIRED` as on `POST /api/clips`; then the clip
 must exist and `source_key` must match its source (`404` otherwise); labels validate as in `POST /api/clips` against the
-clip's stored provenance; runs the §5 replacement for that clip only
+clip's stored provenance, and an unknown name is
+`422 UNKNOWN_LABEL` with `details = {"field": "labels", "names": [...]}`,
+checked before the ownership lookup; runs the §5 replacement for that clip only
 and records the caller in `source_attribution` (§4). Idempotent:
 submitting the current set is a no-op semantically.
 
@@ -1383,6 +1429,28 @@ Response `200`:
 There is no "list my sources" endpoint: the farm doesn't know which
 sources are whose (§1.2.17). The client knows, from the source keys it
 holds.
+
+#### `POST /api/labels/candidates` — suggest names the vocabulary lacks
+
+Session required; per-user POST bucket (§7.2). Not gated on consent:
+it stores no pose and no account id. Request:
+
+```json
+{"names": ["raiz", "butterfly twist"]}
+```
+
+Validation: `names` is an array of 1 to 20 strings, each 1 to 64
+characters after trimming; otherwise `422 VALIDATION_ERROR` with
+`details.field = "names"` (and `details.index` for a bad entry).
+
+Behavior: names already in the vocabulary are skipped. Each other name
+is stored in `label_candidates` with the caller's `account_hash`
+(§1.2.25), once per account and name, case-insensitively; resubmitting
+keeps the first `submitted_at`. The app sends a typed name here when
+the user names a clip with something the vocabulary lacks, and labels
+the clip with vocabulary names only.
+
+Response `202`, no body.
 
 #### `GET /api/sources/:id` — source with confirmed clips + labels
 
@@ -1738,6 +1806,9 @@ checklist:
 - No Apple profile data beyond the `sub` claim: no name, no email.
   Identity tokens and email notifications carry an email address; it is
   discarded unread.
+- No free-text label names: labels come only from the vocabulary, and
+  a candidate name is kept 30 days under a keyed hash of the account,
+  never its id (§1.2.25).
 - No app profile state: no achievements, levels, progress, scores,
   gallery grouping, highlights, favorites, spots, or which clips show
   the user (§1.2.21). Provenance fields (§1.2.18) say how a label was
@@ -1790,9 +1861,6 @@ live. Items move out of this list into the sections above as they are
 built; until then, the sections above describe the code. The app side
 is in turnip-ios `CONTRIBUTION_DESIGN.md` §8.1.
 
-- **Labels.** Only vocabulary names are accepted. A new name goes to a
-  candidate list, counted per account by keyed hash, kept briefly and
-  promoted by hand.
 - **Kept training data.** *Built* (§1.2.24): segments, their
   transform, and the link deleted with the account. Still to do: the
   public commitment that the set is never published and never
@@ -1812,9 +1880,10 @@ is in turnip-ios `CONTRIBUTION_DESIGN.md` §8.1.
    (§1.2.14, §7.1).
 4. **R2 topology.** Bucket, region, and presigned-URL TTL policy are ops
    details not specified here (15-minute TTLs assumed above).
-5. **Taxonomy curation.** Who canonicalizes new free-text names and
-   bumps `taxonomy_version` (master plan §9 Q1) — the versioning
-   mechanics are specified here; the human process is not.
+5. **Taxonomy curation.** Who canonicalizes new names and bumps
+   `taxonomy_version` (master plan §9 Q1). The mechanics are specified
+   (§1.2.25: candidates, `labels:promote`); the human process and a
+   promotion threshold are not.
 6. **Apple key and secret management.** Where `APPLE_PRIVATE_KEY` and
    `APPLE_REFRESH_TOKEN_KEY` live, and how the latter rotates. A
    rotation needs a key ID on the stored ciphertext, which §3 does not
