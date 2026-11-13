@@ -296,6 +296,14 @@ Two departures from the master plan's label draft follow from this:
       its candidates. There is no HTTP admin route.
     The 30-day expiry is a judgment call (`LABEL_CANDIDATE_TTL_DAYS` in
     `src/labels.ts`). Labels already stored keep their names.
+26. **Public counts are coarse.** *Added 2026-11 by the privacy plan*
+    (§8.1). `GET /api/stats` is public and refreshed every minute, so an
+    exact count lets anyone who knows a person just joined or labeled
+    confirm it, from a day with one signup or from the totals ticking
+    up by one. Every published count, the daily series and the totals
+    alike, is rounded down to a multiple of 5 (`STATS_COUNT_STEP` in
+    `src/stats.ts`, a judgment call): a day with 1–4 reads 0, and the
+    totals move in steps of 5.
 
 ## 2. Conventions
 
@@ -1600,14 +1608,15 @@ version 1.
 
 Public: no session (§7.1). Aggregate-only totals and daily series for
 the public site's stats section: user signups and labeling
-contributions over the last 90 UTC days, including today. Response
+contributions over the last 90 UTC days, including today. Every count
+is rounded down to a multiple of 5, so 1–4 reads 0 (§1.2.26). Response
 `200`:
 
 ```json
 {
-  "totals": {"users": 12, "sources": 48, "clips": 210, "labels": 530},
-  "users_by_day": [{"date": "2026-10-29", "count": 2}],
-  "labels_by_day": [{"date": "2026-10-29", "count": 9}]
+  "totals": {"users": 10, "sources": 45, "clips": 210, "labels": 530},
+  "users_by_day": [{"date": "2026-10-29", "count": 0}],
+  "labels_by_day": [{"date": "2026-10-29", "count": 5}]
 }
 ```
 
@@ -1865,7 +1874,6 @@ is in turnip-ios `CONTRIBUTION_DESIGN.md` §8.1.
   transform, and the link deleted with the account. Still to do: the
   public commitment that the set is never published and never
   re-identified.
-- **Public stats.** `/api/stats` rounds or suppresses small counts.
 
 ## 9. Open questions
 

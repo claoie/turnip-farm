@@ -430,6 +430,11 @@ main.page section li strong {
   margin: 4px 0 0;
 }
 
+.stat-note {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
 .chart-block {
   margin: 0 0 28px;
 }

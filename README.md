@@ -71,7 +71,7 @@ The site is the marketing home page, the support and privacy pages
 page at `/status`, showing service health, the current champion model,
 the vocabulary, and community stats (user signups and labeling
 contributions over the last 90 days, from the public `GET /api/stats`
-endpoint). The status page reads only the public endpoints
+endpoint, every count rounded down to a multiple of 5). The status page reads only the public endpoints
 above; it never authenticates and never shows the model's presigned R2
 URL.
 

@@ -345,8 +345,9 @@ export function StatusPage() {
                   <p className="stat-label">Labels</p>
                 </div>
               </div>
+              <p className="stat-note">Counts are rounded down to a multiple of 5, so small numbers show as 0.</p>
               {stats.data.users_by_day.every((point) => point.count === 0) ? (
-                <p>No signups yet.</p>
+                <p>No day with 5 or more signups yet.</p>
               ) : (
                 <BarChart
                   label="New users per day"
@@ -355,7 +356,7 @@ export function StatusPage() {
                 />
               )}
               {stats.data.labels_by_day.every((point) => point.count === 0) ? (
-                <p>No labels yet.</p>
+                <p>No day with 5 or more labels yet.</p>
               ) : (
                 <BarChart
                   label="Labels per day"
