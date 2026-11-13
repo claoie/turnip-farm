@@ -948,9 +948,11 @@ for `users.apple_refresh_token`).
   accessibility as the session token. Keychain items survive app
   deletion and reinstall on current iOS, but Apple doesn't guarantee
   it, so a lost key is an expected state, not an error.
-- Account deletion: delete every source the app holds a key for, then
-  call `DELETE /api/account`, then delete the local keys and session
-  token (§7.3).
+- Account deletion: Settings offers two choices with equal weight,
+  "Delete my account" and "Also delete my contributions". Delete every
+  source the app holds a key for, then call `DELETE /api/account`, with
+  `?contributions=delete` for the second choice, then delete the local
+  keys and session token (§7.3).
 - Consent: the contribution sheet shows the disclosure with a required
   "I'm 16 or older" confirmation, and Confirm calls `POST /api/consent`
   with the disclosure's version (§7.3). On `403 CONSENT_REQUIRED` from
@@ -958,8 +960,11 @@ for `users.apple_refresh_token`).
   `403 REGION_UNAVAILABLE`, it stops offering contribution.
 - Disclosure (version 3), shown at contribution consent and again at
   account deletion: contributions stay linked to the account until the
-  account is deleted, by the user or after 24 months without use, and
-  deleting the account deletes them. The consent copy also asks users
+  account is deleted, by the user or after 24 months without use.
+  Deleting the account deletes the full recordings and the link; short,
+  transformed training segments stay without any link to the account
+  unless the user also chooses "Also delete my contributions" (§7.3).
+  The consent copy also asks users
   to contribute only clips of themselves, or of people who agreed: the
   person in a clip may not be the account holder. Versions 1 and 2 said
   contributions were unlinked 30 days after the last edit; the farm
@@ -1087,7 +1092,14 @@ sign out cleanly. Allowed for blocked users.
 #### `DELETE /api/account` — delete my account
 
 App Review guideline 5.1.1(v). Session required; allowed for blocked
-users.
+users. Optional query parameter `contributions`:
+
+- `keep` (the default): the account's training segments stay as
+  de-linked training data (§1.2.24).
+- `delete`: they are deleted too, with their blobs.
+
+Any other value is `422 VALIDATION_ERROR` with
+`details.field = "contributions"`, before anything is deleted.
 
 **Client first.** Before calling this endpoint, the app deletes every
 source it holds a key for, with `DELETE /api/sources/:id`. The farm
@@ -1111,14 +1123,19 @@ finishes the job:
    deleted. Any other error is logged and deletion proceeds: the user's
    right to delete does not depend on Apple's answer.
 2. Delete every source attributed to the user (§4): first its R2 blob
-   and any staged upload, then the row. Clips, labels, quarantine rows,
-   training membership and attribution cascade.
+   and any staged upload (and, with `contributions=delete`, the blobs of
+   its training segments), then the rows. Clips, labels, quarantine rows,
+   training membership, attribution and `segment_sources` links cascade;
+   with `contributions=delete` the segment rows are deleted in the same
+   transaction. Without it, no full-session pose, attribution or link to
+   the account survives, only de-linked segments.
 3. `DELETE FROM users WHERE id = $1`. Sessions, consents and reports
    cascade.
 
 Response `204`. A retry after success gets `401` (the session is gone).
 The hourly idle-account job runs the same three steps for accounts idle
-for 24 months (§1.2.17, §4).
+for 24 months (§1.2.17, §4), with `contributions=keep`, and so does the
+`account-deleted` notification (steps 2 and 3).
 
 #### `POST /api/consent` — record agreement to the contribution disclosure
 
@@ -1751,9 +1768,11 @@ checklist:
 - Consent is recorded per account and disclosure version (`consents`),
   and contribution requires the current version and a 16+ confirmation
   (§7.3 `POST /api/consent`).
-- Account deletion (§7.3) removes the account, its sessions, its
-  consents, and every contribution attributed to it or still keyed on
-  the device. Accounts idle for 24 months are deleted the same way
+- Account deletion (§7.3) removes the account, its sessions, its Apple
+  token, its consents, its attribution, and the whole-session pose of
+  every contribution attributed to it or still keyed on the device.
+  "Also delete my contributions" (`?contributions=delete`) removes the
+  training segments cut from them too; otherwise those stay, de-linked. Accounts idle for 24 months are deleted the same way
   (§1.2.17). The account's whole-session pose goes with it; its
   training segments stay, de-linked (§1.2.24). Data deleted outright
   leaves the next training dataset, because training rebuilds from a
@@ -1771,9 +1790,6 @@ live. Items move out of this list into the sections above as they are
 built; until then, the sections above describe the code. The app side
 is in turnip-ios `CONTRIBUTION_DESIGN.md` §8.1.
 
-- **Deletion.** Account deletion removes the account, sessions, Apple
-  token, attribution and full-session pose, and keeps only de-linked
-  segments. The app also offers "Also delete my contributions".
 - **Labels.** Only vocabulary names are accepted. A new name goes to a
   candidate list, counted per account by keyed hash, kept briefly and
   promoted by hand.

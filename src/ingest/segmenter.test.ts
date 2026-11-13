@@ -5,7 +5,7 @@
 import { SQL, type TransactionSQL } from "bun";
 import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { TEST_DATABASE_URL, inRollback } from "../../db/testing";
-import { deleteAccountData } from "../auth/account";
+import { deleteAccountData, handleDeleteAccount } from "../auth/account";
 import { sha256Hex } from "../auth/tokens";
 import { handleDeleteSource } from "../contrib/sources";
 import { handlePurgeQuarantine } from "../quarantine";
@@ -203,6 +203,66 @@ describeDb("segment lifecycle", () => {
       expect(bucket.objects.has(`poses/${SOURCE_ID}.tkp1.gz`)).toBe(false);
       expect((await segments(tx)).map((r: any) => r.r2_key)).toEqual(kept);
       for (const key of kept) expect(bucket.objects.has(key)).toBe(true);
+    }));
+
+  test("DELETE /api/account?contributions=delete leaves no row or blob for the account", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const bucket = memoryBucket();
+      await seed(tx, bucket);
+      await segmentDirtySources({ sql: tx, store: bucket.store });
+      // Someone else's de-linked segment, which must survive.
+      await tx`INSERT INTO training_segments (id, r2_key, sha256, frame_count, window_start, window_end, split_bucket)
+        VALUES (${clipId(99)}::uuid, ${segmentKeyFor(clipId(99))}, ${"0".repeat(64)}, 20, 5, 15, 0)`;
+      bucket.objects.set(segmentKeyFor(clipId(99)), new Uint8Array(1));
+      await tx`INSERT INTO sessions (user_id, token_hash, expires_at)
+        VALUES (${USER_ID}, ${sha256Hex("session-for-u1")}, now() + interval '1 hour')`;
+      const accountDeps = {
+        sql: tx,
+        r2: bucket.r2,
+        refreshTokenKey: {} as CryptoKey,
+        revokeRefreshToken: async () => {},
+      };
+      const del = (query: string) =>
+        new Request(`http://farm.test/api/account${query}`, {
+          method: "DELETE",
+          headers: { authorization: "Bearer session-for-u1" },
+        });
+
+      const bad = await handleDeleteAccount(del("?contributions=everything"), accountDeps);
+      expect(bad.status).toBe(422);
+      expect(((await bad.json()) as { error: { details: unknown } }).error.details).toEqual({ field: "contributions" });
+      expect(await tx`SELECT id FROM users`).toHaveLength(1);
+
+      expect((await handleDeleteAccount(del("?contributions=delete"), accountDeps)).status).toBe(204);
+      for (const table of ["users", "sessions", "consents", "source_attribution", "sources", "clips", "labels", "segment_sources"]) {
+        expect(await tx`SELECT 1 FROM ${tx(table)}`).toHaveLength(0);
+      }
+      expect((await segments(tx)).map((r: any) => r.id)).toEqual([clipId(99)]);
+      expect(await tx`SELECT 1 FROM training_segment_labels`).toHaveLength(0);
+      expect([...bucket.objects.keys()]).toEqual([segmentKeyFor(clipId(99))]);
+    }));
+
+  test("DELETE /api/account?contributions=keep is the default: only de-linked segments survive", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const bucket = memoryBucket();
+      await seed(tx, bucket);
+      await segmentDirtySources({ sql: tx, store: bucket.store });
+      await tx`INSERT INTO sessions (user_id, token_hash, expires_at)
+        VALUES (${USER_ID}, ${sha256Hex("session-for-u1")}, now() + interval '1 hour')`;
+      const res = await handleDeleteAccount(
+        new Request("http://farm.test/api/account?contributions=keep", {
+          method: "DELETE",
+          headers: { authorization: "Bearer session-for-u1" },
+        }),
+        { sql: tx, r2: bucket.r2, refreshTokenKey: {} as CryptoKey, revokeRefreshToken: async () => {} },
+      );
+      expect(res.status).toBe(204);
+      for (const table of ["users", "sources", "source_attribution", "segment_sources"]) {
+        expect(await tx`SELECT 1 FROM ${tx(table)}`).toHaveLength(0);
+      }
+      const kept = await segments(tx);
+      expect(kept).toHaveLength(2);
+      expect([...bucket.objects.keys()].sort()).toEqual(kept.map((r: any) => r.r2_key).sort());
     }));
 
   test("DELETE /api/sources/:id removes the source's segments and their blobs", async () =>
