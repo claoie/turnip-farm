@@ -184,7 +184,11 @@ data (`BACKEND_DESIGN.md` §9 Q9) — unlinking would then keep its costs
 (the deletion gap, source-level splits, the moving parts) and lose most
 of its benefit — or a social feature is put on the roadmap. A reversal
 lands before the farm's first deployment, while restoring `user_id` is
-still a plain additive migration.
+still a plain additive migration. *Under review (2026-11):* the
+maintainer's privacy plan, written with an AI legal-risk review rather
+than counsel, treats unlinked pose sequences as personal data that is
+de-linked and hard to re-identify, not anonymous, and proposes keeping
+the link until deletion (`BACKEND_DESIGN.md` §8.1). Not built yet.
 
 **What this kills from DESIGN.md Rev 8:** presigned video upload to R2,
 server-side video storage, server-rendered video feed, and every sentence

@@ -173,6 +173,12 @@ Two departures from the master plan's label draft follow from this:
     data anyway, or a social feature is put on the roadmap. A reversal
     lands before the first deployment, while restoring `sources.user_id`
     is a plain additive migration.
+    *Under review (2026-11):* the maintainer's privacy plan, written
+    with an AI legal-risk review rather than counsel, treats unlinked
+    pose sequences as personal data that is de-linked and hard to
+    re-identify, not anonymous. It proposes keeping the account link
+    until deletion, plus a 24-month inactivity expiry, in place of the
+    30-day purge (§8.1). Not built yet.
 18. **Labels carry provenance, never identity.** Each label row records
     its `origin`: `typed` (typed by hand), `vocabulary` (picked from the
     vocabulary's suggestions), or `model` (pre-filled by the trick model
@@ -859,10 +865,11 @@ for `users.apple_refresh_token`).
   deletion: contributions stay linked to the account for 30 days after
   the last edit, and after that are kept without any link to it.
   Deleting the account removes every contribution the app can still
-  find. The rest can't be traced back to the user and remain in the
-  training data. The consent copy also asks users to contribute only
-  clips of themselves, or of people who agreed: the person in a clip
-  may not be the account holder.
+  find. The rest remain in the training data with no link to the
+  account, though someone with a video of the same clip could still
+  match them to it (§9 Q9). The consent copy also asks users to
+  contribute only clips of themselves, or of people who agreed: the
+  person in a clip may not be the account holder.
 
 ### 7.2 Conventions
 
@@ -979,7 +986,8 @@ Before calling this endpoint, the app deletes every source it holds a
 key for, with `DELETE /api/sources/:id`. The farm cannot enforce this
 step. Contributions whose keys the app no longer holds, and that are
 past the window, remain as training data that no record links to the
-user. The app says so when the user contributes and again when they
+user, though they can still be matched to a video of the same clip
+(§9 Q9). The app says so when the user contributes and again when they
 delete the account (§7.1, §8).
 
 **Then the server**, in order, so a retry after a partial failure
@@ -1555,6 +1563,34 @@ checklist:
   Models already trained on it are treated as anonymous, pending the
   assessment in §9 Q8.
 
+### 8.1 Planned changes (privacy plan, 2026-11)
+
+The maintainer's privacy plan changes the farm before contribution goes
+live. None of this is built yet; until it is, the sections above
+describe the code. The app side is in turnip-ios
+`CONTRIBUTION_DESIGN.md` §8.1.
+
+- **Consent on the farm.** Each agreement is recorded with its account,
+  time and disclosure version. Accounts that agreed to the 30-day wording
+  are asked again. Users must be 16 or older.
+- **Retention.** `source_attribution` is kept until the user deletes it,
+  or after 24 months without activity, in place of the 30-day purge
+  (§1.2.17). Logs and backups keep their 30-day caps.
+- **Deletion.** Account deletion removes the account, sessions, Apple
+  token, attribution and full-session pose. The app also offers "Also
+  delete my contributions".
+- **Labels.** Only vocabulary names are accepted. A new name goes to a
+  candidate list, counted per account by keyed hash, kept briefly and
+  promoted by hand.
+- **Kept training data.** Ingest cuts short segments. Each is centered
+  on the hips, scaled to a standard body, reduced to one head point and
+  lightly noised, with fresh IDs, no timestamps and no adjacent segments
+  kept. A segment-to-source link exists only while the account does. The
+  set is never published, and the farm commits publicly not to
+  re-identify it.
+- **Public stats.** `/api/stats` rounds or suppresses small counts.
+- **EU and UK.** Contribution stays switched off there for now.
+
 ## 9. Open questions
 
 1. **Pipeline key management.** Who issues and rotates
@@ -1583,14 +1619,18 @@ checklist:
    treating it as anonymous needs a documented assessment (EDPB Opinion
    28/2024): a membership-inference check in the holdout evaluation,
    and confirmation that no pose sequences ship inside model artifacts.
-   Owned by the training design.
+   Owned by the training design. *Proposed (§8.1):* also no
+   per-example embeddings in a model, and rare tricks held back until
+   enough people contribute them.
 9. **Residual linkage.** Unlinked contributions can still be matched
    against a public video of the person in them, and an imported
    file's `video_id` can be recomputed by anyone holding the file
    (§1.2.17). Counsel should confirm whether that leaves them personal
    data. The answer is now also a reopen trigger for unlinking itself:
    if unlinked pose sequences are personal data anyway, linking may be
-   the better trade (§1.2.17).
+   the better trade (§1.2.17). *Proposed answer (2026-11), not from
+   counsel:* treat them as personal data, de-linked and hard to
+   re-identify, and keep the link until deletion (§8.1).
 10. **Log and backup retention.** §8 caps logs and database backups at
     30 days; the deployment runbook has to implement that for Postgres
     backups, the farm's logs, and the reverse proxy's access logs.
