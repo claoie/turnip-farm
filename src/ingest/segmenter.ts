@@ -30,6 +30,7 @@ import {
   encodeTks1,
   retargetSegment,
   type Rng,
+  torsoScale,
   splitBucket,
 } from "./segments";
 import { decodeTkp1, gunzipStaged, gzipCanonical } from "./tkp1";
@@ -106,6 +107,8 @@ export async function segmentSource(deps: SegmenterDeps, sourceId: string): Prom
 
   const rng = deps.rng ?? cryptoRng;
   const bucket = splitBucket(sourceId);
+  // One scale for every segment of the source (§1.2.24).
+  const scale = torsoScale(pose);
   const fresh: {
     id: string;
     r2Key: string;
@@ -117,7 +120,7 @@ export async function segmentSource(deps: SegmenterDeps, sourceId: string): Prom
   }[] = [];
   try {
     for (const cut of chooseSegments(clips, pose.frameCount)) {
-      const frames = retargetSegment(pose, cut.from, cut.to, rng);
+      const frames = retargetSegment(pose, cut.from, cut.to, rng, scale);
       if (frames === null) continue;
       const id = crypto.randomUUID();
       const bytes = gzipCanonical(encodeTks1(frames));

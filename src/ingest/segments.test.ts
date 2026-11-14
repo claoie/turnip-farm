@@ -17,6 +17,7 @@ import {
   encodeTks1,
   retargetSegment,
   splitBucket,
+  torsoScale,
 } from "./segments";
 import type { DecodedTkp1 } from "./tkp1";
 
@@ -175,10 +176,39 @@ describe("retargetSegment", () => {
     expect(frames[0]).toHaveLength(13);
   });
 
-  test("null when no frame has both hips and both shoulders", () => {
+  test("null when no frame of the blob has both hips and both shoulders, or the segment has no hips", () => {
     const torsoless = body(0.5, 0.6, 0.5);
     delete torsoless[5];
+    expect(torsoScale(pose([torsoless]))).toBeNull();
     expect(retargetSegment(pose([torsoless]), 0, 1, noNoise)).toBeNull();
+    const hipless = body(0.5, 0.6, 0.5);
+    delete hipless[11];
+    // The blob has a torso to scale by, but the segment has nothing to center on.
+    expect(retargetSegment(pose([body(0.5, 0.6, 0.5), hipless]), 1, 2, noNoise)).toBeNull();
+  });
+
+  test("two segments cut from one blob share one scale: the blob's median torso", () => {
+    // 11 frames of a large subject (torso 0.25), then 9 of a small one
+    // (torso 0.125) jumping 0.1 every other frame. The blob's median
+    // torso is 0.25; the small segment's own median would be 0.125.
+    const frames = [
+      ...Array.from({ length: 11 }, () => body(0.5, 0.6, 0.5)),
+      ...Array.from({ length: 9 }, (_, i) => body(0.5, i % 2 === 0 ? 0.6 : 0.5, 0.25)),
+    ];
+    const blob = pose(frames);
+    expect(torsoScale(blob)).toBeCloseTo(0.25, 5);
+
+    const small = retargetSegment(blob, 11, 20, noNoise)!;
+    const big = retargetSegment(blob, 0, 5, noNoise)!;
+    const rootY = (f: SegmentFrame) => midpoint(f[7], f[8]).y;
+    // The 0.1 jump reads 0.1 / 0.25 = 0.4 torso lengths, not 0.1 / 0.125 = 0.8.
+    expect(rootY(small[0]!) - rootY(small[1]!)).toBeCloseTo(0.4, 5);
+    // Passing the scale explicitly is the same as the default.
+    expect(retargetSegment(blob, 11, 20, noNoise, torsoScale(blob))).toEqual(small);
+    // Both segments still center on their own mean root.
+    expect(rootY(big[0]!)).toBeCloseTo(0, 5);
+    const smallMean = small.reduce((sum, f) => sum + rootY(f), 0) / small.length;
+    expect(smallMean).toBeCloseTo(0, 5);
   });
 
   test("adds Gaussian noise with the configured spread", () => {

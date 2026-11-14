@@ -147,40 +147,58 @@ function median(values: number[]): number {
 export type SegmentFrame = ({ x: number; y: number; c: number } | null)[];
 
 /**
+ * The blob's median torso length (hip midpoint to shoulder midpoint, in
+ * TKP1 units) over every frame with both hips and both shoulders, or null
+ * when no frame has them. Taken over the whole blob, not one segment, so
+ * every segment of a source shares one scale and the app, which sees the
+ * whole session but not where a clip will be cut, can compute the same
+ * value (turnip-ml MODEL_CONTRACT.md §3.6).
+ */
+export function torsoScale(pose: DecodedTkp1): number | null {
+  const lengths: number[] = [];
+  for (const frame of pose.frames) {
+    const p = readFrame(frame);
+    const r = mid(p[11]!, p[12]!);
+    const n = mid(p[5]!, p[6]!);
+    if (r && n) lengths.push(Math.hypot(n.x - r.x, n.y - r.y));
+  }
+  if (lengths.length === 0) return null;
+  const scale = median(lengths);
+  return scale > 0 ? scale : null;
+}
+
+/**
  * Re-targets canonical frames [from, to) onto the standard body:
  * - the root is the hip midpoint; a frame missing either hip is a gap;
  * - root positions are centered on their mean over the segment and scaled
- *   by the segment's median torso length, so the result is in torso
- *   lengths and the subject's place in the picture is gone;
+ *   by the blob's median torso length (`torsoScale`), so the result is in
+ *   torso lengths and the subject's place in the picture is gone;
  * - every other joint is placed from its parent along the observed bone
  *   direction at the standard bone length (STANDARD_BONES), so joint
  *   angles survive and proportions don't; a joint whose parent is missing
  *   is missing;
  * - the head is one point, the mean of the detected keypoints 0–4;
  * - Gaussian noise with SEGMENT_NOISE_SD is added to every joint's x and y.
- * Confidence is carried over from the observed joint. Returns null when no
- * frame has both hips and both shoulders (nothing to scale by).
+ * Confidence is carried over from the observed joint. Returns null when the
+ * blob has no frame with both hips and both shoulders (nothing to scale
+ * by), or the segment has no frame with both hips (nothing to center on).
+ * `scale` defaults to `torsoScale(pose)`; a caller cutting several
+ * segments from one blob computes it once and passes it.
  */
 export function retargetSegment(
   pose: DecodedTkp1,
   from: number,
   to: number,
   rng: Rng,
+  scale: number | null = torsoScale(pose),
 ): SegmentFrame[] | null {
+  if (scale === null) return null;
   const observed = pose.frames.slice(from, to).map(readFrame);
   const roots = observed.map((p) => mid(p[11]!, p[12]!));
   const necks = observed.map((p) => mid(p[5]!, p[6]!));
 
-  const torsoLengths: number[] = [];
-  for (let i = 0; i < observed.length; i++) {
-    const r = roots[i]!;
-    const n = necks[i]!;
-    if (r && n) torsoLengths.push(Math.hypot(n.x - r.x, n.y - r.y));
-  }
-  const scale = torsoLengths.length > 0 ? median(torsoLengths) : 0;
-  if (!(scale > 0)) return null;
-
   const present = roots.filter((r): r is NonNullable<Point> => r !== null);
+  if (present.length === 0) return null;
   const cx = present.reduce((s, r) => s + r.x, 0) / present.length;
   const cy = present.reduce((s, r) => s + r.y, 0) / present.length;
 

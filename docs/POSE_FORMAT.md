@@ -352,9 +352,14 @@ lengths** in a body-centered frame, with the same axis directions as
 
 - The **root** is the hip midpoint (`TKP1` 11 and 12). Root positions
   are centered on their mean over the segment and divided by the
-  segment's median torso length (hip midpoint to shoulder midpoint, in
-  `TKP1` units). Root motion, such as a jump, survives; the subject's
-  place in the picture does not. The root itself is not stored; it is
+  **blob's** median torso length: hip midpoint to shoulder midpoint, in
+  `TKP1` units, over every frame of the whole canonical blob that has
+  both hips and both shoulders. Every segment of a source therefore
+  shares one scale, and a client holding the whole session computes the
+  same value without knowing where a clip will be cut. A blob with no
+  such frame yields no segments, and neither does a segment with no
+  frame that has both hips. Root motion, such as a jump, survives; the
+  subject's place in the picture does not. The root itself is not stored; it is
   the midpoint of joints 7 and 8.
 - Every other joint is placed from its parent along the **observed bone
   direction** at the **standard bone length**, so joint angles survive

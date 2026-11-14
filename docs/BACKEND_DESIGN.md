@@ -244,8 +244,11 @@ Two departures from the master plan's label draft follow from this:
       segment would start fewer than 10 frames (1 s) after the last kept
       segment ends is dropped, so no two kept segments overlap or touch
       and a session can't be stitched back together.
-    - **Transform:** centered on the hips and scaled by the median torso
-      length; every bone re-targeted to a standard length along its
+    - **Transform:** centered on the segment's mean hip position and
+      scaled by the median torso length over the whole blob, so every
+      segment of a source shares one scale and the app can compute it
+      from the session it holds (turnip-ml `MODEL_CONTRACT.md` §3.6);
+      every bone re-targeted to a standard length along its
       observed direction (proportions go, angles stay); keypoints 0–4
       collapsed to one head point; Gaussian noise of 0.02 torso lengths
       on every joint.
@@ -268,7 +271,10 @@ Two departures from the master plan's label draft follow from this:
       write set `sources.segments_dirty_at`; the job re-cuts a dirty
       source from its canonical blob, replaces its segments (new ids,
       fresh noise) in one transaction claimed by compare-and-set on
-      `segments_dirty_at`, and deletes the replaced blobs.
+      `segments_dirty_at`, and deletes the replaced blobs. A change to
+      the transform ships with a migration that marks every ingested
+      source dirty, so existing segments are re-cut (as the 2026-11
+      switch to the blob-wide torso scale did).
     The constants (context, maximum length, minimum gap, noise, bone
     lengths, bucket count) are judgment calls, named in
     `src/ingest/segments.ts`. Logs never put a segment id next to a
