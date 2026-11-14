@@ -261,7 +261,9 @@ Two departures from the master plan's label draft follow from this:
       training data. Deleting a source directly (`DELETE
       /api/sources/:id`) or purging it from quarantine deletes its
       linked segments and their blobs too. A segment that is already
-      de-linked can no longer be found by source.
+      de-linked can no longer be found by source, and so can't be
+      quarantined: `POST /api/quarantine` resolves `segment_ids` through
+      this link and counts de-linked ones as `unlinked` (§7.3).
     - **When:** clips arrive after ingest, so cutting happens in a
       segmenter job on the ingest poller's interval (`src/ingest/segmenter.ts`),
       not inside the staged-upload ingest. Ingest and every clip or label
@@ -1803,14 +1805,27 @@ Request:
 
 ```json
 {
+  "segment_ids": ["<uuid>", "..."],
   "source_ids": ["<64-char hex>", "..."],
   "reason": "fixture regression: challenger 0.61 < champion 0.66",
   "metrics": {"challenger": 0.61, "champion": 0.66}
 }
 ```
 
-Inserts one `data_quarantine` row per id (`reason`, `metrics` JSONB
-snapshot; the farm assigns `id` and `quarantined_at`). Ids that already
+`segment_ids` and `source_ids` are each optional, at most 10000 ids,
+and at least one of them must be non-empty; otherwise `422
+VALIDATION_ERROR`. The pipeline trains on segments and knows only their
+ids (§1.2.24; turnip-ml `TRAINING_DESIGN.md` §10 Q14), so it sends
+`segment_ids`: each resolves through `segment_sources` to the source it
+is still linked to, and that source is quarantined as below, so all of
+its segments leave the export. A segment that is de-linked (its account
+was deleted) or no longer exists (re-cut or deleted since the pull) has
+nothing left to quarantine; it is counted, not fatal. `source_ids` is
+still accepted, for the maintainer and for pipelines that predate
+segments.
+
+Inserts one `data_quarantine` row per source (`reason`, `metrics` JSONB
+object; the farm assigns `id` and `quarantined_at`). Ids that already
 have an open quarantine are skipped — the `data_quarantine_open_uniq`
 partial index makes resubmission a no-op, not an error
 (`ON CONFLICT ... DO NOTHING`). Unknown source ids are reported, not
@@ -1819,8 +1834,22 @@ and this call, and quarantining a deleted source is meaningless.
 Response `200`:
 
 ```json
-{"quarantined": ["<id>", "..."], "already_open": ["<id>"], "unknown": ["<id>"]}
+{
+  "quarantined": ["<id>", "..."],
+  "already_open": ["<id>"],
+  "unknown": ["<id>"],
+  "segments": {"sources_quarantined": 3, "sources_already_open": 1, "unlinked": 2}
+}
 ```
+
+`quarantined`, `already_open` and `unknown` cover `source_ids` only.
+`segments` covers `segment_ids`, as counts only:
+`sources_quarantined` and `sources_already_open` count the distinct
+sources the segments resolved to, and `unlinked` counts the distinct
+segment ids that resolved to no source. The farm never returns the
+source ids behind segments: that would hand the pipeline the
+segment-to-source link the export withholds (§1.2.24). The maintainer
+reads the quarantined sources from `data_quarantine`.
 
 The id list is explicit, not a farm-side time window: the pipeline
 builds it from a `since=<watermark>` export pull taken after the

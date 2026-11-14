@@ -544,10 +544,11 @@ model now knows gainers this well".
 fixture regression suite (the pose fixture clips on R2 plus
 trick-labeled fixtures — segment IoU + name accuracy vs. champion):
 - On regression: (1) fire a **Discord webhook alert** with the metrics
-  delta and affected source IDs (never account IDs: an alert outlives
-  an account's deletion); (2) **quarantine that day's ingested
-  sources** (`data_quarantine`) and skip them in training; (3) skip
-  promotion.
+  delta and the counts the farm reports (never account IDs: an alert
+  outlives an account's deletion); (2) **quarantine that day's ingested
+  data** by its segment ids, which the farm resolves to their sources
+  (`data_quarantine`, `BACKEND_DESIGN.md` §7.3), and skip them in
+  training; (3) skip promotion.
 - The engineer reviews the quarantine queue, cleans (purge bad
   sources, release good ones); the next night retries.
 - Attribution comes from the farm's `source_attribution`, which links

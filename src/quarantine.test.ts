@@ -97,6 +97,11 @@ describeDb("POST /api/quarantine", () => {
         { source_ids: [vid("a")], reason: "" },
         { source_ids: [vid("a")], reason: "r", metrics: [1] },
         { source_ids: [vid("a")] },
+        { segment_ids: [], reason: "r" },
+        { segment_ids: ["nope"], reason: "r" },
+        { segment_ids: "123e4567-e89b-42d3-a456-426614174000", reason: "r" },
+        { segment_ids: Array.from({ length: 10001 }, () => "123e4567-e89b-42d3-a456-426614174000"), reason: "r" },
+        { reason: "r" },
         "not-an-object",
       ]) {
         const res = await handlePostQuarantine(post("/api/quarantine", body, authHeaders), d);
@@ -122,12 +127,17 @@ describeDb("POST /api/quarantine", () => {
         quarantined: [a, b],
         already_open: [],
         unknown: [unknown],
+        segments: { sources_quarantined: 0, sources_already_open: 0, unlinked: 0 },
       });
 
-      const rows = await tx`SELECT source_id, reason, metrics, resolution FROM data_quarantine ORDER BY source_id`;
+      const rows = await tx`
+        SELECT source_id, reason, metrics, jsonb_typeof(metrics) AS metrics_type, resolution
+        FROM data_quarantine ORDER BY source_id`;
       expect(rows).toHaveLength(2);
       expect(rows[0].reason).toBe("fixture regression");
-      expect(JSON.parse(rows[0].metrics as string)).toEqual({ delta: -0.05 });
+      // Stored as a JSON object, not a JSON-encoded string.
+      expect(rows[0].metrics_type).toBe("object");
+      expect(rows[0].metrics).toEqual({ delta: -0.05 });
       expect(rows[0].resolution).toBeNull();
 
       // Resubmission: the open rows make it a no-op, not an error.
@@ -136,8 +146,80 @@ describeDb("POST /api/quarantine", () => {
         quarantined: [],
         already_open: [a, b],
         unknown: [unknown],
+        segments: { sources_quarantined: 0, sources_already_open: 0, unlinked: 0 },
       });
       expect((await tx`SELECT count(*)::int AS n FROM data_quarantine`) as unknown as { n: number }[]).toEqual([{ n: 2 }]);
+    });
+  });
+});
+
+describeDb("POST /api/quarantine with segment_ids", () => {
+  const seg = (i: number) => `123e4567-e89b-42d3-a456-42661417${String(i).padStart(4, "0")}`;
+
+  async function seedSegment(tx: TransactionSQL, id: string, sourceId?: string) {
+    await tx`INSERT INTO training_segments (id, r2_key, sha256, frame_count, window_start, window_end, split_bucket)
+      VALUES (${id}::uuid, ${`segments/${id}.tks1.gz`}, ${"0".repeat(64)}, 20, 5, 15, 0)`;
+    if (sourceId) await tx`INSERT INTO segment_sources (segment_id, source_id) VALUES (${id}::uuid, ${sourceId})`;
+  }
+
+  test("resolves segments to their sources and reports counts only, never source ids", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const a = vid("a");
+      const b = vid("b");
+      await seedSource(tx, a);
+      await seedSource(tx, b);
+      // Two segments of a, one of b, one de-linked, one that no longer exists.
+      await seedSegment(tx, seg(1), a);
+      await seedSegment(tx, seg(2), a);
+      await seedSegment(tx, seg(3), b);
+      await seedSegment(tx, seg(4));
+      const body = {
+        segment_ids: [seg(1), seg(2), seg(3), seg(3).toUpperCase(), seg(4), seg(5)],
+        reason: "fixture regression",
+        metrics: { delta: -0.05 },
+      };
+      const res = await handlePostQuarantine(post("/api/quarantine", body, authHeaders), deps(tx));
+      expect(res.status).toBe(200);
+      const json = await bodyJson(res);
+      expect(json).toEqual({
+        quarantined: [],
+        already_open: [],
+        unknown: [],
+        segments: { sources_quarantined: 2, sources_already_open: 0, unlinked: 2 },
+      });
+      expect(JSON.stringify(json)).not.toContain(a);
+      const rows = await tx`
+        SELECT source_id, reason, jsonb_typeof(metrics) AS metrics_type FROM data_quarantine ORDER BY source_id`;
+      expect(rows.map((r: any) => [r.source_id, r.reason, r.metrics_type])).toEqual([
+        [a, "fixture regression", "object"],
+        [b, "fixture regression", "object"],
+      ]);
+
+      // Resubmitting, with a source id alongside: open rows make it a no-op.
+      const again = await handlePostQuarantine(
+        post("/api/quarantine", { ...body, source_ids: [a] }, authHeaders),
+        deps(tx),
+      );
+      expect(await bodyJson(again)).toEqual({
+        quarantined: [],
+        already_open: [a],
+        unknown: [],
+        segments: { sources_quarantined: 0, sources_already_open: 2, unlinked: 2 },
+      });
+      expect(await tx`SELECT 1 FROM data_quarantine`).toHaveLength(2);
+    });
+  });
+
+  test("only de-linked segments: 200 with nothing quarantined", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      await seedSegment(tx, seg(1));
+      const res = await handlePostQuarantine(
+        post("/api/quarantine", { segment_ids: [seg(1)], reason: "r" }, authHeaders),
+        deps(tx),
+      );
+      expect(res.status).toBe(200);
+      expect((await bodyJson(res)).segments).toEqual({ sources_quarantined: 0, sources_already_open: 0, unlinked: 1 });
+      expect(await tx`SELECT 1 FROM data_quarantine`).toHaveLength(0);
     });
   });
 });

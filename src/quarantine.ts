@@ -2,7 +2,11 @@
 // §7; issue #19).
 //
 // POST /api/quarantine — the pipeline reports the sources a regressing
-// nightly run ingested: {source_ids, reason, metrics}. Ids that already
+// nightly run ingested: {source_ids, segment_ids, reason, metrics}. The
+// pipeline trains on segments (BACKEND_DESIGN.md §1.2.24) and knows only
+// their ids, so segment_ids resolve through segment_sources to the sources
+// they are still linked to; the response reports those as counts, never
+// source ids, so it doesn't hand the pipeline the segment-to-source link. Ids that already
 // have an open quarantine are a no-op (the data_quarantine_open_uniq
 // partial index enforces one open row per source), so resubmission is
 // safe. The id list comes from a since=<watermark> export pull the
@@ -19,7 +23,7 @@
 import { errorResponse } from "./errors";
 import { transaction } from "./db";
 import { authenticatePipeline, type PipelineDeps } from "./pipeline";
-import { isVideoId, readJsonObject } from "./contrib/validate";
+import { isUuid, isVideoId, readJsonObject } from "./contrib/validate";
 import type { R2Client } from "./r2/client";
 import { stagingKeyFor } from "./r2/keys";
 import { deleteLinkedSegmentRows, linkedSegmentKeys } from "./ingest/segmenter";
@@ -30,6 +34,7 @@ export interface QuarantineDeps extends PipelineDeps {
 }
 
 const MAX_SOURCE_IDS = 10000;
+const MAX_SEGMENT_IDS = 10000;
 const MAX_REASON_LEN = 1000;
 
 const notFound = () => errorResponse(404, "NOT_FOUND", "Not found");
@@ -38,6 +43,7 @@ const invalid = (message: string, details: Record<string, unknown> = {}) =>
 
 interface QuarantineInput {
   sourceIds: string[];
+  segmentIds: string[];
   reason: string;
   metrics: Record<string, unknown> | null;
 }
@@ -45,15 +51,26 @@ interface QuarantineInput {
 async function readQuarantineInput(req: Request): Promise<{ input?: QuarantineInput; error?: Response }> {
   const body = await readJsonObject(req);
   if (!body) return { error: invalid("body must be a JSON object") };
-  const { source_ids, reason, metrics } = body;
+  const { source_ids = [], segment_ids = [], reason, metrics } = body;
 
-  if (!Array.isArray(source_ids) || source_ids.length === 0 || source_ids.length > MAX_SOURCE_IDS) {
-    return { error: invalid("source_ids must be a non-empty array", { max: MAX_SOURCE_IDS }) };
+  if (!Array.isArray(source_ids) || source_ids.length > MAX_SOURCE_IDS) {
+    return { error: invalid("source_ids must be an array", { max: MAX_SOURCE_IDS }) };
+  }
+  if (!Array.isArray(segment_ids) || segment_ids.length > MAX_SEGMENT_IDS) {
+    return { error: invalid("segment_ids must be an array", { max: MAX_SEGMENT_IDS }) };
+  }
+  if (source_ids.length === 0 && segment_ids.length === 0) {
+    return { error: invalid("source_ids or segment_ids must be a non-empty array") };
   }
   const seen = new Set<string>();
   for (const id of source_ids) {
     if (!isVideoId(id)) return { error: invalid("source_ids must be 64-char lowercase hex video ids", { id }) };
     seen.add(id);
+  }
+  const segments = new Set<string>();
+  for (const id of segment_ids) {
+    if (!isUuid(id)) return { error: invalid("segment_ids must be segment uuids", { id }) };
+    segments.add((id as string).toLowerCase());
   }
   if (typeof reason !== "string" || reason.trim() === "" || reason.length > MAX_REASON_LEN) {
     return { error: invalid("reason must be a non-empty string", { maxLength: MAX_REASON_LEN }) };
@@ -64,6 +81,7 @@ async function readQuarantineInput(req: Request): Promise<{ input?: QuarantineIn
   return {
     input: {
       sourceIds: [...seen],
+      segmentIds: [...segments],
       reason: reason.trim(),
       metrics: (metrics ?? null) as Record<string, unknown> | null,
     },
@@ -76,6 +94,7 @@ export async function handlePostQuarantine(req: Request, deps: QuarantineDeps): 
   const { input, error } = await readQuarantineInput(req);
   if (error) return error;
 
+  const metricsJson = JSON.stringify(input!.metrics);
   const result = await transaction(deps.sql, async (tx) => {
     const quarantined: string[] = [];
     const alreadyOpen: string[] = [];
@@ -91,13 +110,37 @@ export async function handlePostQuarantine(req: Request, deps: QuarantineDeps): 
       }
       const inserted = await tx`
         INSERT INTO data_quarantine (source_id, reason, metrics)
-        VALUES (${id}, ${input!.reason}, ${JSON.stringify(input!.metrics)}::jsonb)
+        VALUES (${id}, ${input!.reason}, ${metricsJson}::text::jsonb)
         ON CONFLICT (source_id) WHERE resolved_at IS NULL DO NOTHING
         RETURNING id`;
       if (inserted.length > 0) quarantined.push(id);
       else alreadyOpen.push(id);
     }
-    return { quarantined, already_open: alreadyOpen, unknown };
+
+    // Segment ids, set-based: one count and one insert however long the
+    // list. Every id passed isUuid, so the array literal cannot inject
+    // (Bun doesn't bind a JS array as a Postgres array).
+    const segmentLiteral = `{${input!.segmentIds.join(",")}}`;
+    const [linked] = await tx`
+      SELECT count(*)::int AS segments, count(DISTINCT source_id)::int AS sources
+      FROM segment_sources
+      WHERE segment_id = ANY(${segmentLiteral}::uuid[])`;
+    const fresh = await tx`
+      INSERT INTO data_quarantine (source_id, reason, metrics)
+      SELECT DISTINCT source_id, ${input!.reason}, ${metricsJson}::text::jsonb
+      FROM segment_sources
+      WHERE segment_id = ANY(${segmentLiteral}::uuid[])
+      ON CONFLICT (source_id) WHERE resolved_at IS NULL DO NOTHING
+      RETURNING source_id`;
+    const segments = {
+      // Sources the segments resolved to, newly quarantined or already open.
+      sources_quarantined: fresh.length,
+      sources_already_open: (linked.sources as number) - fresh.length,
+      // De-linked (their account was deleted) or no longer existing (re-cut
+      // or deleted since the pull): nothing left to quarantine.
+      unlinked: input!.segmentIds.length - (linked.segments as number),
+    };
+    return { quarantined, already_open: alreadyOpen, unknown, segments };
   });
   return Response.json(result);
 }
