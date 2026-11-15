@@ -141,6 +141,65 @@ describeDb("vocabulary-only labels", () => {
     }));
 });
 
+describeDb("known names: normalized raw or canonical, at any version", () => {
+  test("a canonical with no raw row, a double-spaced name and mixed case are all known", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      await seedSource(tx);
+      // As `labels:promote raiz "raiz flip"` leaves it: "raiz flip" is only a canonical.
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version) VALUES ('raiz', 'raiz flip', 2)`;
+      const ok = await handlePostClips(post("/api/clips", clipsBody(["Raiz  Flip", " gAiNeR "]), token), deps(tx));
+      expect(ok.status).toBe(200);
+      // The stored name keeps the user's spelling, trimmed.
+      const stored = await tx`SELECT trick_name FROM labels ORDER BY trick_name`;
+      expect(stored.map((r: { trick_name: string }) => r.trick_name)).toEqual(["Raiz  Flip", "gAiNeR"]);
+
+      const relabel = await handlePostClipLabels(
+        post(
+          `/api/clips/${CLIP_ID}/labels`,
+          { source_key: SOURCE_KEY, labels: [{ name: "RAIZ FLIP", origin: "vocabulary" }, { name: "cork   screw", origin: "typed" }] },
+          token,
+        ),
+        deps(tx),
+        CLIP_ID,
+      );
+      // "cork   screw" is not "corkscrew": spaces collapse, they don't vanish.
+      expect(await errorOf(relabel)).toEqual({
+        status: 422,
+        code: "UNKNOWN_LABEL",
+        details: { field: "labels", names: ["cork   screw"] },
+      });
+      const fine = await handlePostClipLabels(
+        post(`/api/clips/${CLIP_ID}/labels`, { source_key: SOURCE_KEY, labels: [{ name: "raiz\tFLIP", origin: "vocabulary" }] }, token),
+        deps(tx),
+        CLIP_ID,
+      );
+      expect(fine.status).toBe(200);
+    }));
+
+  test("candidates skip known names by the same rule, and collapse whitespace when stored", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version) VALUES ('raiz', 'raiz flip', 2)`;
+      const res = await handlePostLabelCandidates(
+        post("/api/labels/candidates", { names: ["Raiz  Flip", "CORK", "Butterfly   Twist", "butterfly twist"] }, token),
+        deps(tx),
+      );
+      expect(res.status).toBe(202);
+      const rows = await tx`SELECT name FROM label_candidates`;
+      expect(rows.map((r: { name: string }) => r.name)).toEqual(["Butterfly Twist"]);
+    }));
+
+  test("labels:promote refuses a name that is already a canonical", async () =>
+    inRollback(sharedSql, async (tx) => {
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version) VALUES ('raiz', 'raiz flip', 2)`;
+      expect(await promoteLabelCli(["Raiz  Flip"], tx, capture().io)).toBe(1);
+      expect(await promoteLabelCli(["Back   Flip", "Back  Flip"], tx, capture().io)).toBe(0);
+      const [row] = await tx`SELECT raw, canonical FROM label_taxonomy WHERE raw LIKE 'back%'`;
+      expect(row).toEqual({ raw: "back flip", canonical: "back flip" });
+    }));
+});
+
 describeDb("POST /api/labels/candidates", () => {
   test("202 stores new names under an HMAC of the account, once per account and name", async () =>
     inRollback(sharedSql, async (tx) => {

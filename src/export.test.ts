@@ -169,8 +169,8 @@ describeDb("GET /api/labels/export", () => {
           suggested_names: ["cork", "flash"],
           suggestions_withheld: false,
           labels: [
-            { trick_name: "cork", origin: "model", taxonomy_version: 1 },
-            { trick_name: "gainer", origin: "typed", taxonomy_version: 1 },
+            { trick_name: "cork", canonical: "cork", origin: "model", taxonomy_version: 1 },
+            { trick_name: "gainer", canonical: "gainer", origin: "typed", taxonomy_version: 1 },
           ],
         },
       ]);
@@ -255,6 +255,31 @@ describeDb("GET /api/labels/export", () => {
       await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version) VALUES
         ('cork', 'corkscrew', 2), ('corkscrew', 'corkscrew', 2)`;
       expect((await pull(tx)).trick_contributors[0]).toEqual({ canonical: "corkscrew", contributors: 2 });
+    });
+  });
+
+  test("each label's canonical resolves by normalized name: raw first, else a canonical itself", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      // "raiz flip" is a canonical with no raw row of its own (labels:promote raiz "raiz flip").
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version) VALUES ('raiz', 'raiz flip', 2)`;
+      await tx`INSERT INTO users (id) VALUES ('u1')`;
+      await seedSource(tx, vid("a"));
+      await tx`INSERT INTO source_attribution (source_id, user_id) VALUES (${vid("a")}, 'u1')`;
+      await seedSegment(tx, segId(1), {
+        sourceId: vid("a"),
+        labels: [{ name: "Raiz  Flip" }, { name: "CorkScrew" }, { name: "legacy  Name" }],
+      });
+      const body = await pull(tx);
+      expect(body.segments[0].labels).toEqual([
+        { trick_name: "CorkScrew", canonical: "cork", origin: "typed", taxonomy_version: 1 },
+        { trick_name: "Raiz  Flip", canonical: "raiz flip", origin: "typed", taxonomy_version: 1 },
+        { trick_name: "legacy  Name", canonical: null, origin: "typed", taxonomy_version: 1 },
+      ]);
+      expect(body.trick_contributors).toEqual([
+        { canonical: "cork", contributors: 1 },
+        { canonical: "legacy name", contributors: 1 },
+        { canonical: "raiz flip", contributors: 1 },
+      ]);
     });
   });
 });

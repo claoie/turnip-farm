@@ -279,10 +279,18 @@ Two departures from the master plan's label draft follow from this:
     privacy plan* (§8.1). A free-text name is whatever the user typed,
     which can be a name, a place or a joke about a friend; the farm has
     no use for that next to a pose sequence. `POST /api/clips` and
-    `POST /api/clips/:id/labels` accept only names that match a `raw`
-    in `label_taxonomy`, case-insensitively and at any taxonomy version
-    (versions are append-only), and answer `422 UNKNOWN_LABEL` with the
-    unknown names otherwise. A name stays as the client cased it.
+    `POST /api/clips/:id/labels` accept only **known** names and answer
+    `422 UNKNOWN_LABEL` with the unknown names otherwise. The rule is
+    shared with the app (turnip-ios #314): a name is known when its
+    normalized form (trimmed, runs of whitespace collapsed to one space,
+    lowercased; `normalizeName` in `src/labels.ts`) equals the
+    normalized form of any `label_taxonomy` **raw or canonical**, at any
+    taxonomy version (versions are append-only). A canonical counts even
+    with no raw row of its own, as `labels:promote raiz "raiz flip"`
+    leaves "raiz flip", because the app lists canonicals for the user to
+    pick. A name is stored as the client sent it, trimmed: its casing
+    and inner spacing stay. The export resolves each stored name to its
+    canonical by the same rule (§7.3 `GET /api/labels/export`).
     A name the vocabulary lacks goes to `POST /api/labels/candidates`
     instead, into `label_candidates`:
     - no account id is stored: each row carries `account_hash`, the
@@ -316,10 +324,10 @@ Two departures from the master plan's label draft follow from this:
     segments carry it. It is counted over segments still linked to an
     attributed source, excluding quarantined sources; a de-linked
     segment's contributor is unknown and counts for nobody, so the count
-    errs toward holding back. A raw name resolves through its
-    greatest-version taxonomy mapping, so aliases count once; a name with
-    no mapping (only labels from before §1.2.25) counts as itself,
-    lowercased. A trick absent from the list has no known contributor.
+    errs toward holding back. A name resolves to its canonical as the
+    export's labels do (§7.3), so aliases count once; a name with no
+    match (only labels from before §1.2.25) counts as its normalized
+    self. A trick absent from the list has no known contributor.
     The export also carries `contributor_minimum`, the hold-back
     threshold (`HOLD_BACK_MIN_CONTRIBUTORS` in `src/export.ts`, 5, a
     judgment call), so the pipeline and the farm read one value. Counts
@@ -923,20 +931,29 @@ Notes:
   canonical because only it knows the accounts:
 
 ```sql
-WITH current_map AS (
-  SELECT DISTINCT ON (lower(raw)) lower(raw) AS raw, canonical
-  FROM label_taxonomy ORDER BY lower(raw), taxonomy_version DESC
+-- norm(x) = lower(regexp_replace(btrim(x), '[[:space:]]+', ' ', 'g'))
+WITH raw_map AS (        -- normalized raw → its greatest-version canonical
+  SELECT DISTINCT ON (norm(raw)) norm(raw) AS n, canonical
+  FROM label_taxonomy ORDER BY norm(raw), taxonomy_version DESC
+),
+canonical_map AS (       -- normalized canonical → that canonical
+  SELECT DISTINCT ON (norm(canonical)) norm(canonical) AS n, canonical
+  FROM label_taxonomy ORDER BY norm(canonical), taxonomy_version DESC
 )
-SELECT COALESCE(m.canonical, lower(l.trick_name)) AS canonical,
+SELECT COALESCE(rm.canonical, cm.canonical, norm(l.trick_name)) AS canonical,
        count(DISTINCT a.user_id) AS contributors
 FROM training_segment_labels l
 JOIN segment_sources ss    ON ss.segment_id = l.segment_id
 JOIN source_attribution a  ON a.source_id = ss.source_id
 LEFT JOIN data_quarantine q ON q.source_id = ss.source_id AND q.resolved_at IS NULL
-LEFT JOIN current_map m     ON m.raw = lower(l.trick_name)
+LEFT JOIN raw_map rm        ON rm.n = norm(l.trick_name)
+LEFT JOIN canonical_map cm  ON cm.n = norm(l.trick_name)
 WHERE q.id IS NULL
 GROUP BY 1 ORDER BY 1;
 ```
+
+The same `raw_map` and `canonical_map` give each exported label its
+`canonical` (§7.3).
 
 ## 7. API
 
@@ -1405,8 +1422,9 @@ Request:
 `proposal_model_version` (default `null`), `suggested_names` (default
 `[]`) and `suggestions_withheld` (default `false`) are the clip's
 provenance (§1.2.18). Each `labels` entry is an object; `origin` is
-required, one of `typed | vocabulary | model`. Every `name` must be in
-the vocabulary (§1.2.25): the first clip with an unknown name fails the
+required, one of `typed | vocabulary | model`. Every `name` must be
+known (§1.2.25: its normalized form matches a taxonomy raw or canonical):
+the first clip with an unknown name fails the
 batch with `422 UNKNOWN_LABEL`, `details = {"index": <clip index>,
 "field": "labels", "names": ["<unknown>", ...]}`, after the other body
 checks and before any source is read.
@@ -1500,9 +1518,10 @@ Validation: `names` is an array of 1 to 20 strings, each 1 to 64
 characters after trimming; otherwise `422 VALIDATION_ERROR` with
 `details.field = "names"` (and `details.index` for a bad entry).
 
-Behavior: names already in the vocabulary are skipped. Each other name
-is stored in `label_candidates` with the caller's `account_hash`
-(§1.2.25), once per account and name, case-insensitively; resubmitting
+Behavior: known names (§1.2.25) are skipped. Each other name is stored
+with runs of whitespace collapsed to one space, in `label_candidates`
+with the caller's `account_hash` (§1.2.25), once per account and name,
+case-insensitively; resubmitting
 keeps the first `submitted_at`. The app sends a typed name here when
 the user names a clip with something the vocabulary lacks, and labels
 the clip with vocabulary names only.
@@ -1745,8 +1764,8 @@ segment, segments of quarantined sources excluded, ordered by
       "suggested_names": ["cork", "gainer"],
       "suggestions_withheld": false,
       "labels": [
-        {"trick_name": "cork", "origin": "model", "taxonomy_version": 3},
-        {"trick_name": "gainer", "origin": "typed", "taxonomy_version": 3}
+        {"trick_name": "Cork", "canonical": "cork", "origin": "model", "taxonomy_version": 3},
+        {"trick_name": "gainer", "canonical": "gainer", "origin": "typed", "taxonomy_version": 3}
       ]
     }
   ],
@@ -1778,14 +1797,21 @@ Fields:
 - `proposal_model_version`, `suggested_names`, `suggestions_withheld`:
   the clip's provenance (§1.2.18).
 - `labels`: the clip's label set, sorted by `trick_name`, each with its
-  `origin` and `taxonomy_version`. Never empty.
+  `origin` and `taxonomy_version`. Never empty. `trick_name` is the
+  name as the user gave it. `canonical` is the farm's resolution of it,
+  by its normalized form (§1.2.25): the greatest-version canonical of a
+  matching raw, else a matching canonical itself, else `null` (a
+  pre-§1.2.25 free-text label). Use `canonical` rather than looking
+  `trick_name` up in `taxonomy`: an exact raw lookup misses a name
+  accepted through a canonical with no raw row, or one with different
+  spacing or case.
 - `trick_contributors` (whole-dataset, the same on every page, like
   `taxonomy`): per canonical trick under the current taxonomy, sorted
   by `canonical`, the number of distinct accounts whose exported,
   non-quarantined segments carry it, counting only segments still
   linked to an account (§1.2.27). A canonical absent from the list has
-  0 known contributors. A label name with no taxonomy mapping appears
-  as its lowercased self.
+  0 known contributors. A label with a `null` canonical appears as its
+  normalized name.
 - `contributor_minimum`: the hold-back threshold. turnip-ml trains a
   trick only when its `contributors >= contributor_minimum` (§9 Q8).
 

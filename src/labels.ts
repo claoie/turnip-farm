@@ -20,15 +20,32 @@ export const MAX_CANDIDATES_PER_REQUEST = 20;
 /** Longest candidate name, in characters after trimming. */
 export const MAX_CANDIDATE_LENGTH = 64;
 
-/** The lowercase vocabulary: every raw string in label_taxonomy, at any version. */
-export async function vocabulary(sql: SQL): Promise<Set<string>> {
-  const rows = (await sql`SELECT DISTINCT lower(raw) AS raw FROM label_taxonomy`) as { raw: string }[];
-  return new Set(rows.map((r) => r.raw));
+/**
+ * A label name's comparison form, shared with the app (turnip-ios #314):
+ * trimmed, runs of whitespace collapsed to one space, lowercased. Two names
+ * are the same vocabulary entry when their normalized forms are equal.
+ * The export resolves stored names with the same rule in SQL (src/export.ts).
+ */
+export function normalizeName(name: string): string {
+  return name.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-/** The names, in order and without duplicates, that the vocabulary lacks (case-insensitive). */
+/**
+ * The vocabulary, normalized: every raw string and every canonical name in
+ * label_taxonomy, at any version. A canonical counts even with no raw row
+ * of its own (`labels:promote raiz "raiz flip"`), since the app lists it.
+ */
+export async function vocabulary(sql: SQL): Promise<Set<string>> {
+  const rows = (await sql`
+    SELECT raw AS name FROM label_taxonomy
+    UNION
+    SELECT canonical FROM label_taxonomy`) as { name: string }[];
+  return new Set(rows.map((r) => normalizeName(r.name)));
+}
+
+/** The names, in order and without duplicates, whose normalized form the vocabulary lacks. */
 export function unknownNames(vocab: Set<string>, names: readonly string[]): string[] {
-  return [...new Set(names.filter((n) => !vocab.has(n.toLowerCase())))];
+  return [...new Set(names.filter((n) => !vocab.has(normalizeName(n))))];
 }
 
 export function unknownLabelResponse(names: string[], details: Record<string, unknown> = {}): Response {
@@ -89,7 +106,8 @@ export async function handlePostLabelCandidates(req: Request, deps: CandidatesDe
   }
   const names: string[] = [];
   for (let i = 0; i < raw.length; i++) {
-    const name = typeof raw[i] === "string" ? (raw[i] as string).trim() : "";
+    // Whitespace collapsed, so "back  flip" and "back flip" count as one name.
+    const name = typeof raw[i] === "string" ? (raw[i] as string).trim().replace(/\s+/g, " ") : "";
     if (name === "" || name.length > MAX_CANDIDATE_LENGTH) {
       return errorResponse(422, "VALIDATION_ERROR", `names[${i}] must be a non-empty string of at most ${MAX_CANDIDATE_LENGTH} characters`, {
         details: { field: "names", index: i },
@@ -141,8 +159,8 @@ export async function labelCandidatesCli(args: string[], sql: SQL, io: Output): 
 // vocabulary, 2 usage.
 export async function promoteLabelCli(args: string[], sql: SQL, io: Output): Promise<number> {
   const [rawArg, canonicalArg] = args;
-  const raw = rawArg?.trim().toLowerCase() ?? "";
-  const canonical = (canonicalArg ?? rawArg ?? "").trim().toLowerCase();
+  const raw = normalizeName(rawArg ?? "");
+  const canonical = normalizeName(canonicalArg ?? rawArg ?? "");
   if (args.length < 1 || args.length > 2 || raw === "" || canonical === "" || raw.length > MAX_CANDIDATE_LENGTH) {
     io.err("usage: bun run labels:promote <name> [<canonical>]");
     return 2;
