@@ -32,6 +32,18 @@ export async function readJsonObject(req: Request): Promise<Record<string, unkno
     : null;
 }
 
+/**
+ * Label-name whitespace, shared with the app and the export SQL
+ * (BACKEND_DESIGN.md §1.2.25): ASCII only, space plus \t \n \v \f \r.
+ * Any other character, a no-break space included, is part of the name.
+ */
+export const ASCII_WHITESPACE_RUN = /[ \t\n\v\f\r]+/g;
+
+/** Trims ASCII whitespace only (String.prototype.trim also strips Unicode spaces). */
+export function trimAsciiWhitespace(s: string): string {
+  return s.replace(/^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g, "");
+}
+
 // How a name was given (§1.2.18): typed by hand, picked from the vocabulary, or
 // kept from the trick model's pre-fill.
 export const LABEL_ORIGINS = ["typed", "vocabulary", "model"] as const;
@@ -64,7 +76,7 @@ export function readLabels(raw: unknown): { labels: Label[] } | { path: string; 
       return { path: `[${i}]`, error: "must be an object with a string name" };
     }
     if (!isOrigin(entry.origin)) return { path: `[${i}].origin`, error: `must be one of ${LABEL_ORIGINS.join(", ")}` };
-    const name = entry.name.trim();
+    const name = trimAsciiWhitespace(entry.name);
     if (name === "") continue;
     const key = name.toLowerCase();
     const cur = groups.get(key);

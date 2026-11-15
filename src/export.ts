@@ -46,10 +46,12 @@ function decodeCursor(since: string): string | null {
 const invalid = (message: string) => errorResponse(422, "VALIDATION_ERROR", message);
 
 // Label names resolve to a canonical by their normalized form (trimmed,
-// whitespace collapsed, lowercased; labels.ts normalizeName): through the
-// greatest-version raw mapping first, else as a canonical itself (§1.2.25),
-// so a name accepted through a canonical with no raw row of its own, or
-// typed with odd spacing or case, still maps. No match: null.
+// whitespace collapsed, lowercased; labels.ts normalizeName), whitespace
+// being ASCII only (the E'...' strings below spell space, tab, LF,
+// VT as \x0B, FF and CR): through the greatest-version raw mapping
+// first, else as a canonical itself (§1.2.25), so a name accepted
+// through a canonical with no raw row of its own, or typed with odd
+// spacing or case, still maps. No match: null.
 //
 // The §6 training query. A segment still linked to a source is excluded
 // while that source has an open quarantine row; a de-linked segment (its
@@ -65,14 +67,14 @@ async function selectSegments(
   return (await sql`
     WITH raw_map AS (
       SELECT DISTINCT ON (n) n, canonical
-      FROM (SELECT lower(regexp_replace(btrim(raw), '[[:space:]]+', ' ', 'g')) AS n,
+      FROM (SELECT lower(regexp_replace(btrim(raw, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g')) AS n,
                    canonical, taxonomy_version
             FROM label_taxonomy) r
       ORDER BY n, taxonomy_version DESC
     ),
     canonical_map AS (
       SELECT DISTINCT ON (n) n, canonical
-      FROM (SELECT lower(regexp_replace(btrim(canonical), '[[:space:]]+', ' ', 'g')) AS n,
+      FROM (SELECT lower(regexp_replace(btrim(canonical, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g')) AS n,
                    canonical, taxonomy_version
             FROM label_taxonomy) c
       ORDER BY n, taxonomy_version DESC
@@ -94,9 +96,9 @@ async function selectSegments(
                             ORDER BY l.trick_name)
             FROM training_segment_labels l
             LEFT JOIN raw_map rm
-                   ON rm.n = lower(regexp_replace(btrim(l.trick_name), '[[:space:]]+', ' ', 'g'))
+                   ON rm.n = lower(regexp_replace(btrim(l.trick_name, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g'))
             LEFT JOIN canonical_map cm
-                   ON cm.n = lower(regexp_replace(btrim(l.trick_name), '[[:space:]]+', ' ', 'g'))
+                   ON cm.n = lower(regexp_replace(btrim(l.trick_name, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g'))
             WHERE l.segment_id = t.id)::text AS labels_json
     FROM training_segments t
     LEFT JOIN segment_sources ss ON ss.segment_id = t.id
@@ -142,29 +144,29 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
   const contributors = (await deps.sql`
     WITH raw_map AS (
       SELECT DISTINCT ON (n) n, canonical
-      FROM (SELECT lower(regexp_replace(btrim(raw), '[[:space:]]+', ' ', 'g')) AS n,
+      FROM (SELECT lower(regexp_replace(btrim(raw, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g')) AS n,
                    canonical, taxonomy_version
             FROM label_taxonomy) r
       ORDER BY n, taxonomy_version DESC
     ),
     canonical_map AS (
       SELECT DISTINCT ON (n) n, canonical
-      FROM (SELECT lower(regexp_replace(btrim(canonical), '[[:space:]]+', ' ', 'g')) AS n,
+      FROM (SELECT lower(regexp_replace(btrim(canonical, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g')) AS n,
                    canonical, taxonomy_version
             FROM label_taxonomy) c
       ORDER BY n, taxonomy_version DESC
     )
     SELECT COALESCE(rm.canonical, cm.canonical,
-                    lower(regexp_replace(btrim(l.trick_name), '[[:space:]]+', ' ', 'g'))) AS canonical,
+                    lower(regexp_replace(btrim(l.trick_name, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g'))) AS canonical,
            count(DISTINCT a.user_id)::int             AS contributors
     FROM training_segment_labels l
     JOIN segment_sources ss    ON ss.segment_id = l.segment_id
     JOIN source_attribution a  ON a.source_id = ss.source_id
     LEFT JOIN data_quarantine q ON q.source_id = ss.source_id AND q.resolved_at IS NULL
     LEFT JOIN raw_map rm
-           ON rm.n = lower(regexp_replace(btrim(l.trick_name), '[[:space:]]+', ' ', 'g'))
+           ON rm.n = lower(regexp_replace(btrim(l.trick_name, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g'))
     LEFT JOIN canonical_map cm
-           ON cm.n = lower(regexp_replace(btrim(l.trick_name), '[[:space:]]+', ' ', 'g'))
+           ON cm.n = lower(regexp_replace(btrim(l.trick_name, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g'))
     WHERE q.id IS NULL
     GROUP BY 1
     ORDER BY 1`) as { canonical: string; contributors: number }[];

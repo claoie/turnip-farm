@@ -288,7 +288,14 @@ Two departures from the master plan's label draft follow from this:
     taxonomy version (versions are append-only). A canonical counts even
     with no raw row of its own, as `labels:promote raiz "raiz flip"`
     leaves "raiz flip", because the app lists canonicals for the user to
-    pick. A name is stored as the client sent it, trimmed: its casing
+    pick. **Whitespace is ASCII only:** space, tab, line feed, vertical
+    tab, form feed and carriage return (`\t \n \v \f \r`), in the app,
+    in the farm's checks and trimming, and in the export SQL, which spells
+    the set out rather than relying on `[[:space:]]`, whose meaning
+    depends on the database locale. Any other character, a no-break space
+    (U+00A0) or an em space included, is part of the name, so a name
+    containing one matches nothing and is unknown on both sides alike.
+    A name is stored as the client sent it, trimmed: its casing
     and inner spacing stay. The export resolves each stored name to its
     canonical by the same rule (§7.3 `GET /api/labels/export`).
     A name the vocabulary lacks goes to `POST /api/labels/candidates`

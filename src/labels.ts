@@ -9,7 +9,7 @@ import type { SQL } from "bun";
 import type { RateLimits } from "./app";
 import { transaction } from "./db";
 import { authenticateClient } from "./auth/sessions";
-import { readJsonObject } from "./contrib/validate";
+import { ASCII_WHITESPACE_RUN, readJsonObject, trimAsciiWhitespace } from "./contrib/validate";
 import { errorResponse } from "./errors";
 import type { Output } from "./moderation";
 
@@ -22,12 +22,13 @@ export const MAX_CANDIDATE_LENGTH = 64;
 
 /**
  * A label name's comparison form, shared with the app (turnip-ios #314):
- * trimmed, runs of whitespace collapsed to one space, lowercased. Two names
+ * trimmed, runs of whitespace collapsed to one space, lowercased, where
+ * whitespace is ASCII only (space, \t \n \v \f \r). Two names
  * are the same vocabulary entry when their normalized forms are equal.
  * The export resolves stored names with the same rule in SQL (src/export.ts).
  */
 export function normalizeName(name: string): string {
-  return name.trim().replace(/\s+/g, " ").toLowerCase();
+  return trimAsciiWhitespace(name).replace(ASCII_WHITESPACE_RUN, " ").toLowerCase();
 }
 
 /**
@@ -107,7 +108,7 @@ export async function handlePostLabelCandidates(req: Request, deps: CandidatesDe
   const names: string[] = [];
   for (let i = 0; i < raw.length; i++) {
     // Whitespace collapsed, so "back  flip" and "back flip" count as one name.
-    const name = typeof raw[i] === "string" ? (raw[i] as string).trim().replace(/\s+/g, " ") : "";
+    const name = typeof raw[i] === "string" ? trimAsciiWhitespace(raw[i] as string).replace(ASCII_WHITESPACE_RUN, " ") : "";
     if (name === "" || name.length > MAX_CANDIDATE_LENGTH) {
       return errorResponse(422, "VALIDATION_ERROR", `names[${i}] must be a non-empty string of at most ${MAX_CANDIDATE_LENGTH} characters`, {
         details: { field: "names", index: i },

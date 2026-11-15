@@ -16,6 +16,7 @@ import {
   deriveCandidateKey,
   handlePostLabelCandidates,
   labelCandidatesCli,
+  normalizeName,
   promoteLabelCli,
 } from "./labels";
 import type { R2Client } from "./r2/client";
@@ -175,6 +176,27 @@ describeDb("known names: normalized raw or canonical, at any version", () => {
         CLIP_ID,
       );
       expect(fine.status).toBe(200);
+    }));
+
+  test("whitespace is ASCII only: a no-break space is part of the name, so it is unknown", async () =>
+    inRollback(sharedSql, async (tx) => {
+      expect(normalizeName(" Raiz\t\v\f\r\n Flip ")).toBe("raiz flip");
+      expect(normalizeName("raiz\u00a0flip")).toBe("raiz\u00a0flip");
+      expect(normalizeName("\u00a0cork\u2003")).toBe("\u00a0cork\u2003");
+
+      const token = await seedUser(tx, "u1");
+      await seedSource(tx);
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version) VALUES ('raiz', 'raiz flip', 2)`;
+      for (const name of ["Raiz\u00a0Flip", "cork\u00a0", "\u2003cork"]) {
+        const res = await handlePostClips(post("/api/clips", clipsBody([name]), token), deps(tx));
+        expect(await errorOf(res)).toEqual({
+          status: 422,
+          code: "UNKNOWN_LABEL",
+          details: { index: 0, field: "labels", names: [name] },
+        });
+      }
+      const ascii = await handlePostClips(post("/api/clips", clipsBody(["Raiz\u000b\fFlip"]), token), deps(tx));
+      expect(ascii.status).toBe(200);
     }));
 
   test("candidates skip known names by the same rule, and collapse whitespace when stored", async () =>

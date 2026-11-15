@@ -269,6 +269,8 @@ describeDb("GET /api/labels/export", () => {
         sourceId: vid("a"),
         labels: [{ name: "Raiz  Flip" }, { name: "CorkScrew" }, { name: "legacy  Name" }],
       });
+      // ASCII whitespace (VT, FF) collapses; a no-break space doesn't, so no match.
+      await seedSegment(tx, segId(2), { labels: [{ name: "raiz\u000b\fflip" }, { name: "Raiz\u00a0Flip" }] });
       const body = await pull(tx);
       expect(body.segments[0].labels).toEqual([
         { trick_name: "CorkScrew", canonical: "cork", origin: "typed", taxonomy_version: 1 },
@@ -279,6 +281,10 @@ describeDb("GET /api/labels/export", () => {
         { canonical: "cork", contributors: 1 },
         { canonical: "legacy name", contributors: 1 },
         { canonical: "raiz flip", contributors: 1 },
+      ]);
+      expect(body.segments[1].labels).toEqual([
+        { trick_name: "Raiz\u00a0Flip", canonical: null, origin: "typed", taxonomy_version: 1 },
+        { trick_name: "raiz\u000b\fflip", canonical: "raiz flip", origin: "typed", taxonomy_version: 1 },
       ]);
     });
   });
