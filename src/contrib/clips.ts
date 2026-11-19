@@ -22,7 +22,7 @@ import {
   type R2Client,
 } from "../r2/client";
 import type { RateLimits } from "../app";
-import { Slots } from "../slots";
+import { Slots, SlotsFullError } from "../slots";
 import {
   isSourceKey,
   isUuid,
@@ -52,7 +52,15 @@ export const MAX_CLIPS_BODY_BYTES = 1024 * 1024;
  * of up to MAX_CANONICAL_BLOB_BYTES, so the count bounds their sum.
  */
 export const CONCURRENT_BLOB_VERIFICATIONS = 2;
-const blobVerifications = new Slots(CONCURRENT_BLOB_VERIFICATIONS);
+/**
+ * Verifications that may wait for a slot; past that a submission answers
+ * 429. Bounding the shared wait, rather than the sources in one batch,
+ * bounds what any one contributor can make everyone else wait.
+ */
+export const QUEUED_BLOB_VERIFICATIONS = 8;
+/** Eight cap-size verifications took 2.8 s through the two slots at the deployment's CPU share, so a full queue drains in about 4 s. */
+export const BLOB_VERIFICATION_RETRY_AFTER_S = 5;
+const blobVerifications = new Slots(CONCURRENT_BLOB_VERIFICATIONS, QUEUED_BLOB_VERIFICATIONS);
 
 const notFound = () => errorResponse(404, "NOT_FOUND", "Not found");
 
@@ -221,6 +229,11 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
     } catch (e) {
       if (e instanceof BlobTooLargeError) {
         return errorResponse(422, "BLOB_TOO_LARGE", `source ${sourceId}: blob exceeds ${MAX_CANONICAL_BLOB_BYTES} bytes`, { details: {} });
+      }
+      if (e instanceof SlotsFullError) {
+        return errorResponse(429, "RATE_LIMITED", "Too many requests", {
+          headers: { "Retry-After": String(BLOB_VERIFICATION_RETRY_AFTER_S) },
+        });
       }
       throw e;
     }

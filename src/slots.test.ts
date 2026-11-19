@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { Slots } from "./slots";
+import { Slots, SlotsFullError } from "./slots";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
@@ -32,6 +32,25 @@ describe("Slots", () => {
     expect(await Promise.all(runs)).toEqual([0, 1, 2, 3]);
     expect(started).toEqual([0, 1, 2, 3]);
     expect(most).toBe(2);
+  });
+
+  test("past maxWaiting, use throws without running the task", async () => {
+    const slots = new Slots(1, 1);
+    const held = deferred();
+    const running = slots.use(() => held.promise);
+    const waiting = slots.use(async () => "waited");
+    let ran = false;
+    const third = slots.use(async () => {
+      ran = true;
+    });
+    const outcome = await Promise.race([third.then(() => "admitted", (err) => err), Bun.sleep(20).then(() => "queued")]);
+    expect(outcome).toBeInstanceOf(SlotsFullError);
+    expect(ran).toBe(false);
+    held.resolve();
+    await running;
+    expect(await waiting).toBe("waited");
+    // The wait list emptied, so the next task is admitted again.
+    expect(await slots.use(async () => "again")).toBe("again");
   });
 
   test("a task that throws frees its slot", async () => {

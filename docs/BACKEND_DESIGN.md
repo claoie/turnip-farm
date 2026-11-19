@@ -1597,7 +1597,9 @@ Behavior, in a single transaction:
    `422 BLOB_MISSING` (the client waits for ingest, re-uploads via
    `POST /api/sources`, and retries). Otherwise fetch the R2 object at
    `r2_key` and compare its SHA-256 against `sources.sha256`; a
-   mismatch → `422 BLOB_DIGEST_MISMATCH`.
+   mismatch → `422 BLOB_DIGEST_MISMATCH`. The farm verifies two blobs
+   at a time across all requests and queues eight more; past that the
+   batch gets `429 RATE_LIMITED` with `Retry-After` and writes nothing.
 4. Upsert the clip rows (§4).
 5. Replace each clip's label set (§5); `labels` is optional per clip and
    may be `[]` (clears the set).

@@ -18,7 +18,14 @@ import {
   handleRegisterSource,
   type SourcesDeps,
 } from "./sources";
-import { CONCURRENT_BLOB_VERIFICATIONS, handlePostClipLabels, handlePostClips, type ClipsDeps } from "./clips";
+import {
+  BLOB_VERIFICATION_RETRY_AFTER_S,
+  CONCURRENT_BLOB_VERIFICATIONS,
+  QUEUED_BLOB_VERIFICATIONS,
+  handlePostClipLabels,
+  handlePostClips,
+  type ClipsDeps,
+} from "./clips";
 
 const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -590,6 +597,55 @@ describeDb("POST /api/clips", () => {
       }
       expect((await Promise.all(submissions)).map((res) => res.status)).toEqual([200, 200, 200, 200]);
       expect(mostOpen).toBe(CONCURRENT_BLOB_VERIFICATIONS);
+    });
+  });
+
+  test("429 with Retry-After once the verification queue is full, without reading the blob", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      const blob = new TextEncoder().encode("b");
+      await seedIngestedSource(tx, token, createHash("sha256").update(blob).digest("hex"));
+      const finish: (() => void)[] = [];
+      let reads = 0;
+      const r2: R2Client = {
+        ...fakeR2(),
+        getStream: async () => {
+          reads++;
+          return new ReadableStream<Uint8Array<ArrayBuffer>>({
+            start(controller) {
+              finish.push(() => {
+                controller.enqueue(blob.slice());
+                controller.close();
+              });
+            },
+          });
+        },
+      };
+      const d = deps(tx, r2);
+      let settled = 0;
+      const admitted = CONCURRENT_BLOB_VERIFICATIONS + QUEUED_BLOB_VERIFICATIONS;
+      const submissions = Array.from({ length: admitted }, () =>
+        handlePostClips(post("/api/clips", clipBody(), authed(token)), d).finally(() => settled++),
+      );
+      const until = async (done: () => boolean) => {
+        for (let i = 0; i < 400 && !done(); i++) await Bun.sleep(5);
+      };
+      await until(() => finish.length === CONCURRENT_BLOB_VERIFICATIONS);
+      await Bun.sleep(30);
+
+      const refused = await handlePostClips(post("/api/clips", clipBody(), authed(token)), d);
+      await expectError(refused, 429, "RATE_LIMITED");
+      expect(refused.headers.get("retry-after")).toBe(String(BLOB_VERIFICATION_RETRY_AFTER_S));
+      expect(reads).toBe(CONCURRENT_BLOB_VERIFICATIONS);
+
+      // The admitted ones all finish, one stream at a time.
+      for (let i = 0; i < admitted; i++) {
+        await until(() => finish.length > i);
+        finish[i]!();
+        await until(() => settled > i);
+      }
+      expect((await Promise.all(submissions)).map((res) => res.status)).toEqual(Array(admitted).fill(200));
+      expect(reads).toBe(admitted);
     });
   });
 
