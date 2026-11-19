@@ -6,6 +6,7 @@ import { importRefreshTokenKey } from "./auth/tokens";
 import { type Config, ConfigError, loadConfig } from "./config";
 import { deleteIdleAccounts } from "./auth/account";
 import { purgeExpiredAdminSessions } from "./auth/admin";
+import { purgeStaleTrainingSourcePages } from "./models";
 import { createAuthClient } from "./auth/auth-client";
 import { purgeExpiredAttribution } from "./contrib/purge";
 import { deriveCandidateKey } from "./labels";
@@ -70,6 +71,7 @@ const candidateKey = await deriveCandidateKey(config.apple.refreshTokenKey);
 const retention = async () => {
   await purgeExpiredAttribution(sql).catch((err) => console.error("retention purge failed:", err));
   await purgeExpiredAdminSessions(sql).catch((err) => console.error("admin session purge failed:", err));
+  await purgeStaleTrainingSourcePages(sql).catch((err) => console.error("training-source page purge failed:", err));
   await deleteIdleAccounts({ sql, r2, refreshTokenKey, revokeRefreshToken, candidateKey })
     .then(({ deleted, failed }) => {
       if (deleted > 0 || failed > 0) console.log(`idle accounts: ${deleted} deleted, ${failed} failed`);

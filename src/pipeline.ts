@@ -1,5 +1,5 @@
 // Pipeline service-key auth (BACKEND_DESIGN.md §7.1): the training
-// pipeline's endpoints (`GET /api/labels/export`, `POST /api/models`,
+// pipeline's endpoints (`GET /api/labels/export`, `POST /api/models*`,
 // `POST /api/quarantine*`) authenticate with the pre-shared
 // TURNIP_PIPELINE_KEY as `Authorization: Bearer <key>` — never a Sign in
 // with Apple session (§1.2.7).

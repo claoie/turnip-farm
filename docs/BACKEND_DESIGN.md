@@ -215,9 +215,10 @@ Two departures from the master plan's label draft follow from this:
     records which sources trained each promoted model, so an owner can
     see that their contribution went into a model
     (`GET /api/sources/:id` → `trained_in`). The pipeline sends the list
-    with `POST /api/models`. It holds no account and cascades with the
-    source; ids of sources deleted between training and publish are
-    skipped, not rejected.
+    with `POST /api/models`, the ids past its first 1,000 in pages ahead
+    of it (`POST /api/models/training-sources`, §7.3). It holds no
+    account and cascades with the source; ids of sources deleted between
+    training and publish are skipped, not rejected.
 21. **No profile state.** The app's Profile tab (achievements, levels,
     progress, the gallery, highlights) is computed on the device and
     never sent here (master plan §1). There is no profile,
@@ -627,6 +628,18 @@ CREATE TABLE model_training_sources (
   source_id     CHAR(64) NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
   -- The sources a promoted model trained on (§1.2.20). No account column.
   PRIMARY KEY (source_id, model_version)
+);
+
+CREATE TABLE model_training_source_pages (
+  model_version TEXT NOT NULL,
+  model_sha256  CHAR(64) NOT NULL CHECK (model_sha256 ~ '^[0-9a-f]{64}$'),
+  source_id     CHAR(64) NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  staged_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Training sources sent ahead of a publish, keyed by the version and
+  -- the artifact digest it will carry (§7.3). The publish moves them into
+  -- model_training_sources; pages no publish takes are deleted a day
+  -- after they arrive. No account column.
+  PRIMARY KEY (model_version, model_sha256, source_id)
 );
 
 CREATE TABLE data_quarantine (
@@ -1053,7 +1066,8 @@ source of truth, so sign-out, revoked consent, and account deletion end
 sessions immediately. Sessions expire after 90 days without use; Apple
 notes that "User sessions are long-lived on device".
 
-**Pipeline** (`POST /api/models`, `GET /api/labels/export`): pre-shared
+**Pipeline** (`POST /api/models`, `POST /api/models/training-sources`,
+`GET /api/labels/export`): pre-shared
 service key, `Authorization: Bearer <TURNIP_PIPELINE_KEY>`.
 
 **Admin** (`/api/admin/*` and `/auth/*`, §7.3): the maintainer signs
@@ -1263,9 +1277,10 @@ for `users.apple_refresh_token`).
     never stored or logged (§8).
 - **Request bodies** are read as they arrive, up to a cap per route:
   1 MiB for `POST /api/clips` (about 3,000 clips) and
-  `POST /api/quarantine`, 8 MiB for `POST /api/models` (100,000 training
-  source ids), 64 KiB for every other route. A body over its route's cap
-  gets `422 VALIDATION_ERROR` with `details.maxBytes`; one over 8 MiB is
+  `POST /api/quarantine`, 128 KiB for `POST /api/models` and
+  `POST /api/models/training-sources` (1,000 training source ids plus the
+  manifest), 64 KiB for every other route. A body over its route's cap
+  gets `422 VALIDATION_ERROR` with `details.maxBytes`; one over 1 MiB is
   refused by the server with a bare `413` before any route reads it.
 - **Rate limiting:** per-user token bucket on POST endpoints
   (suggested: 60 requests/minute; `429 RATE_LIMITED` with
@@ -1868,20 +1883,44 @@ Request:
 }
 ```
 
-`training_source_ids` (optional, at most 100000) names the exported
-sources the model trained on: the export rows' `source_id`.
+`training_source_ids` (optional, at most 1000) names the exported
+sources the model trained on: the export rows' `source_id`. A model that
+trained on more sends the rest first with
+`POST /api/models/training-sources`, below.
 `training_segment_ids` is no longer read (training segments are removed,
 §1.2.24); a body that still carries it is accepted, and those ids record
 nothing.
 
 Behavior: inserts per §4 with `promoted_at = now()`, and in the same
-transaction records `training_source_ids` in `model_training_sources`
-(§4), skipping ids whose source no longer exists. An existing
+transaction records `training_source_ids` and the pages sent ahead for
+this `version` and `sha256` in `model_training_sources` (§4), skipping
+ids whose source no longer exists, then deletes the version's pages. The
+model is current only once that transaction commits, so it is never
+current with part of its list. Pages sent for another `sha256` (an
+earlier attempt with another artifact) are not recorded. An existing
 `version` → `409 VERSION_EXISTS` (bump the version instead), with
 nothing recorded. A rollback publish (`TRAINING_DESIGN.md` §8) sends
 the re-promoted champion's own source list. Response `201`:
 `{"id": "<uuid>", "version": "...", "promoted_at": "...",
-"training_sources_recorded": 1287}`.
+"training_sources_recorded": 1287}`, counting the inline ids and the
+pages.
+
+#### `POST /api/models/training-sources` — a page of training sources ahead of a publish (service key)
+
+Request:
+
+```json
+{"version": "trick-v1.2", "sha256": "<64-char hex of the artifact>", "training_source_ids": ["<64-char hex>", "..."]}
+```
+
+At most 1000 ids per page; send as many pages as needed, then
+`POST /api/models` with the same `version` and `sha256`. Ids of sources
+that no longer exist are skipped, and a page sent twice stages nothing
+new, so a retried publish re-sends every page. A `version` that is already
+published → `409 VERSION_EXISTS`, with nothing staged. Pages no publish
+takes are deleted a day after they arrive. Response `200`:
+`{"version": "trick-v1.2", "training_sources_staged": 1000}`, the ids
+this page added.
 
 #### `GET /api/labels/export?since=` — training pull (service key)
 

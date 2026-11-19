@@ -16,7 +16,7 @@ import {
 import { MAX_CLIPS_BODY_BYTES, handlePostClipLabels, handlePostClips } from "./contrib/clips";
 import { handleGetLabelsExport } from "./export";
 import { handleGetTaxonomyCurrent } from "./taxonomy";
-import { MAX_PUBLISH_BODY_BYTES, handleGetModelsCurrent, handlePostModels } from "./models";
+import { MAX_PUBLISH_BODY_BYTES, handleGetModelsCurrent, handlePostModels, handlePostTrainingSourcePage } from "./models";
 import { handleGetStats } from "./stats";
 import {
   MAX_QUARANTINE_BODY_BYTES,
@@ -175,6 +175,9 @@ export function createHandler(deps: AppDeps, opts: HandlerOptions = {}): (req: R
       }
       if (seg[1] === "models") {
         if (method === "POST" && seg.length === 2) return handlePostModels(req, deps);
+        if (method === "POST" && seg.length === 3 && seg[2] === "training-sources") {
+          return handlePostTrainingSourcePage(req, deps);
+        }
         if (method === "GET" && seg.length === 3 && seg[2] === "current") {
           return handleGetModelsCurrent(req, deps);
         }

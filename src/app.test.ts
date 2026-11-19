@@ -146,6 +146,7 @@ describe("createHandler routing", () => {
       ["POST", "/api/reports/abc"],
       ["GET", "/api/models"],
       ["POST", "/api/models/current"],
+      ["GET", "/api/models/training-sources"],
     ] as const) {
       const res = await handle(request(method, path));
       expect(res.status).toBe(404);
@@ -162,6 +163,7 @@ describe("createHandler routing", () => {
       ["POST", `/api/quarantine/${vid}/release`, undefined],
       ["POST", `/api/quarantine/${vid}/purge`, undefined],
       ["POST", "/api/models", JSON.stringify({ version: "x" })],
+      ["POST", "/api/models/training-sources", JSON.stringify({ version: "x" })],
     ] as const) {
       const res = await handle(
         new Request(`http://farm.test${path}`, {

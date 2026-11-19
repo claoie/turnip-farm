@@ -8,8 +8,11 @@ import { SQL } from "bun";
 import { afterAll, describe, expect, test } from "bun:test";
 import { TEST_DATABASE_URL, inRollback } from "../db/testing";
 import {
+  MAX_SOURCE_IDS_PER_REQUEST,
   handleGetModelsCurrent,
   handlePostModels,
+  handlePostTrainingSourcePage,
+  purgeStaleTrainingSourcePages,
   validatePublishInput,
   type ModelsDeps,
   type PublishInput,
@@ -140,12 +143,57 @@ describe("validatePublishInput", () => {
     [
       "non-array source ids",
       { ...validBody(), training_source_ids: "b".repeat(64) },
-      "training_source_ids must be an array",
+      "training_source_ids must be an array of at most 1000; send the rest first with POST /api/models/training-sources",
+    ],
+    [
+      "more source ids than one request carries",
+      { ...validBody(), training_source_ids: Array.from({ length: 1001 }, (_, i) => i.toString(16).padStart(64, "0")) },
+      "training_source_ids must be an array of at most 1000; send the rest first with POST /api/models/training-sources",
     ],
   ])("rejects %s", (_name, body, message) => {
     const { input, error } = validatePublishInput(body);
     expect(input).toBeUndefined();
     expect(error).toBe(message);
+  });
+});
+
+test("accepts exactly MAX_SOURCE_IDS_PER_REQUEST source ids", () => {
+  const ids = Array.from({ length: MAX_SOURCE_IDS_PER_REQUEST }, (_, i) => i.toString(16).padStart(64, "0"));
+  expect(validatePublishInput({ ...validBody(), training_source_ids: ids }).input?.trainingSourceIds).toHaveLength(1000);
+});
+
+const pageReq = (body: unknown, headers: Record<string, string> = AUTH) =>
+  new Request("http://farm.test/api/models/training-sources", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+
+describe("handlePostTrainingSourcePage", () => {
+  test("401 on a wrong pipeline key, before any DB touch", async () => {
+    const res = await handlePostTrainingSourcePage(
+      pageReq({ version: "trick-v1.2", sha256: "a".repeat(64), training_source_ids: [] }, {}),
+      deps,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test.each([
+    ["a missing version", { sha256: "a".repeat(64), training_source_ids: [] }, "version"],
+    ["a malformed sha256", { version: "trick-v1.2", sha256: "nope", training_source_ids: [] }, "sha256"],
+    [
+      "more than one page of ids",
+      {
+        version: "trick-v1.2",
+        sha256: "a".repeat(64),
+        training_source_ids: Array.from({ length: 1001 }, (_, i) => i.toString(16).padStart(64, "0")),
+      },
+      "at most 1000",
+    ],
+  ])("422 on %s, before any DB touch", async (_name, body, message) => {
+    const res = await handlePostTrainingSourcePage(pageReq(body), deps);
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: { message: string } }).error.message).toContain(message);
   });
 });
 
@@ -307,26 +355,71 @@ describe.skipIf(!TEST_DATABASE_URL)("model registry, DB-backed", () => {
     });
   });
 
-  test("records training sources past the first insert batch", async () => {
+  test("pages sent ahead join the publish atomically; other artifacts' pages don't", async () => {
     await inRollback(sql, async (tx) => {
       const d: ModelsDeps = { sql: tx, pipelineKey: PIPELINE_KEY, r2: stubR2 };
-      // 10,001 ids cross the 10,000-id insert batch; live sources sit at both ends.
-      const ids = Array.from({ length: 10001 }, (_, i) => i.toString(16).padStart(64, "0"));
-      const live = [ids[0]!, ids[10000]!];
-      for (const id of live) {
+      const [a, b, c, other] = ["1", "2", "3", "4"].map((ch) => ch.repeat(64)) as [string, string, string, string];
+      for (const id of [a, b, c, other]) {
         await tx`
           INSERT INTO sources (id, source_key_hash, frame_count, sample_rate, r2_key)
           VALUES (${id}, ${"f".repeat(64)}, 600, 30, ${`poses/${id}.tkp1.gz`})`;
       }
+      const sha = "a".repeat(64);
+      const page = async (ids: string[], sha256 = sha) => {
+        const res = await handlePostTrainingSourcePage(
+          pageReq({ version: "trick-v1.5", sha256, training_source_ids: ids }),
+          d,
+        );
+        return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+      };
+      // A deleted source is skipped; a repeated page stages nothing new.
+      expect(await page([a, "0".repeat(64)])).toEqual({
+        status: 200,
+        body: { version: "trick-v1.5", training_sources_staged: 1 },
+      });
+      expect((await page([b])).body.training_sources_staged).toBe(1);
+      expect((await page([a])).body.training_sources_staged).toBe(0);
+      // A page for another artifact under the same version.
+      expect((await page([other], "e".repeat(64))).body.training_sources_staged).toBe(1);
+
+      // Nothing is visible before the publish.
+      const before = await handleGetModelsCurrent(new Request("http://farm.test/api/models/current"), d);
+      expect(before.status).toBe(404);
+
       const res = await handlePostModels(
-        postReq({ ...validBody(), version: "trick-v1.4", training_source_ids: ids }),
+        postReq({ ...validBody(), version: "trick-v1.5", sha256: sha, training_source_ids: [c] }),
         d,
       );
       expect(res.status).toBe(201);
-      expect(((await res.json()) as Record<string, unknown>).training_sources_recorded).toBe(2);
+      expect(((await res.json()) as Record<string, unknown>).training_sources_recorded).toBe(3);
       const membership = await tx`
-        SELECT source_id FROM model_training_sources WHERE model_version = 'trick-v1.4' ORDER BY source_id`;
-      expect(membership.map((r: { source_id: string }) => r.source_id)).toEqual(live);
+        SELECT source_id FROM model_training_sources WHERE model_version = 'trick-v1.5' ORDER BY source_id`;
+      expect(membership.map((r: { source_id: string }) => r.source_id)).toEqual([a, b, c]);
+      const left = await tx`SELECT count(*)::int AS n FROM model_training_source_pages WHERE model_version = 'trick-v1.5'`;
+      expect(left[0]!.n).toBe(0);
+
+      // A published version takes no more pages.
+      const late = await page([other]);
+      expect(late.status).toBe(409);
+      expect((late.body.error as { code: string }).code).toBe("VERSION_EXISTS");
+      const after = await tx`SELECT count(*)::int AS n FROM model_training_source_pages`;
+      expect(after[0]!.n).toBe(0);
+    });
+  });
+
+  test("purgeStaleTrainingSourcePages deletes only pages older than a day", async () => {
+    await inRollback(sql, async (tx) => {
+      const id = "5".repeat(64);
+      await tx`
+        INSERT INTO sources (id, source_key_hash, frame_count, sample_rate, r2_key)
+        VALUES (${id}, ${"f".repeat(64)}, 600, 30, ${`poses/${id}.tkp1.gz`})`;
+      await tx`
+        INSERT INTO model_training_source_pages (model_version, model_sha256, source_id, staged_at)
+        VALUES ('trick-v9.0', ${"a".repeat(64)}, ${id}, now() - interval '25 hours'),
+               ('trick-v9.1', ${"a".repeat(64)}, ${id}, now() - interval '23 hours')`;
+      expect(await purgeStaleTrainingSourcePages(tx as unknown as SQL)).toBe(1);
+      const left = await tx`SELECT model_version FROM model_training_source_pages`;
+      expect(left.map((r: { model_version: string }) => r.model_version)).toEqual(["trick-v9.1"]);
     });
   });
 

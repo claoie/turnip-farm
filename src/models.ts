@@ -6,6 +6,12 @@
 // version is a 409 VERSION_EXISTS with nothing recorded, because a
 // version is immutable once published (§4).
 //
+// POST /api/models/training-sources — a model that trained on more
+// sources than one publish carries sends the rest first, in pages. They
+// wait in model_training_source_pages until the publish moves them into
+// model_training_sources, so the model is never current with part of its
+// list.
+//
 // GET /api/models/current — the public trick-model manifest: the current
 // champion's artifact pointer, descriptors, metrics, and the vocabulary
 // the model trained on. Public like GET /api/taxonomy/current (§1.2.19):
@@ -13,11 +19,11 @@
 // of the model version, Cache-Control: max-age=300. 404 NO_MODEL before
 // the first promotion.
 
+import type { SQL } from "bun";
 import { errorResponse } from "./errors";
 import { transaction } from "./db";
 import { authenticatePipeline, type PipelineDeps } from "./pipeline";
 import { isVideoId, readJsonObject } from "./contrib/validate";
-import { heavyJobs } from "./heavy-jobs";
 import type { R2Client } from "./r2/client";
 import { buildVocabulary } from "./taxonomy";
 
@@ -33,11 +39,15 @@ const MAX_KEY_LEN = 1024;
 const MAX_CLIENT_VERSION_LEN = 50;
 const MAX_REPORT_KEY_LEN = 1024;
 const MAX_RUN_ID_LEN = 200;
-const MAX_SOURCE_IDS = 100000;
-/** MAX_SOURCE_IDS quoted ids at 67 bytes each, with room for the metrics. */
-export const MAX_PUBLISH_BODY_BYTES = 8 * 1024 * 1024;
-/** Training-source ids per INSERT, so the id literal stays small however many a model names. */
-const TRAINING_SOURCE_BATCH = 10000;
+/** Training-source ids per request; more go ahead of the publish in pages. */
+export const MAX_SOURCE_IDS_PER_REQUEST = 1000;
+/**
+ * A publish with MAX_SOURCE_IDS_PER_REQUEST ids (67 KB of them) and
+ * name_metrics for about 650 tricks; a page of ids alone is 67 KB.
+ */
+export const MAX_PUBLISH_BODY_BYTES = 128 * 1024;
+/** Pages never consumed by a publish are deleted this long after they arrive. */
+const STALE_PAGE_AGE = "1 day";
 
 export interface PublishInput {
   version: string;
@@ -122,15 +132,9 @@ export function validatePublishInput(body: unknown): {
   }
   let sourceIds: string[] = [];
   if (trainingSourceIds !== undefined) {
-    if (!Array.isArray(trainingSourceIds) || trainingSourceIds.length > MAX_SOURCE_IDS) {
-      return { error: "training_source_ids must be an array" };
-    }
-    for (const id of trainingSourceIds) {
-      if (!isVideoId(id)) {
-        return { error: "training_source_ids must be 64-char lowercase hex source ids" };
-      }
-    }
-    sourceIds = [...new Set(trainingSourceIds as string[])];
+    const read = readSourceIds(trainingSourceIds);
+    if ("error" in read) return read;
+    sourceIds = read.ids;
   }
 
   return {
@@ -152,14 +156,28 @@ export function validatePublishInput(body: unknown): {
   };
 }
 
+function readSourceIds(raw: unknown): { ids: string[] } | { error: string } {
+  if (!Array.isArray(raw) || raw.length > MAX_SOURCE_IDS_PER_REQUEST) {
+    return {
+      error: `training_source_ids must be an array of at most ${MAX_SOURCE_IDS_PER_REQUEST}; ` +
+        "send the rest first with POST /api/models/training-sources",
+    };
+  }
+  for (const id of raw) {
+    if (!isVideoId(id)) return { error: "training_source_ids must be 64-char lowercase hex source ids" };
+  }
+  return { ids: [...new Set(raw as string[])] };
+}
+
+// Bun's SQL driver serializes a JS array as bare comma-joined text, which is
+// not a Postgres array literal, so the literal is built here. Every id passed
+// isVideoId (64-char lowercase hex), so the joined literal cannot inject.
+const idArrayLiteral = (ids: string[]) => `{${ids.join(",")}}`;
+
 // POST /api/models — pipeline publishes the champion (service key).
 export async function handlePostModels(req: Request, deps: ModelsDeps): Promise<Response> {
   const authed = authenticatePipeline(req, deps.pipelineKey);
   if (authed) return authed;
-  return heavyJobs.use(() => publish(req, deps));
-}
-
-async function publish(req: Request, deps: ModelsDeps): Promise<Response> {
   const { input, error } = validatePublishInput(await readJsonObject(req, MAX_PUBLISH_BODY_BYTES));
   if (error || !input) return invalid(error ?? "invalid body");
 
@@ -186,25 +204,22 @@ async function publish(req: Request, deps: ModelsDeps): Promise<Response> {
     if (!row) return null;
     // §1.2.20: ids of sources deleted between the training run and the
     // publish match no row and are skipped, not rejected (§4's shape).
-    // Bun's SQL driver serializes a JS array as bare comma-joined text, so
-    // interpolating the array directly is not a valid Postgres array literal
-    // ("malformed array literal" 500s every publish). The literal is built in
-    // JS instead: every id here passed isVideoId (64-char lowercase hex) in
-    // validatePublishInput, so the joined literal cannot inject.
-    let recorded = 0;
-    for (let i = 0; i < input.trainingSourceIds.length; i += TRAINING_SOURCE_BATCH) {
-      const idLiteral = `{${input.trainingSourceIds.slice(i, i + TRAINING_SOURCE_BATCH).join(",")}}`;
-      const result = await tx`
-        INSERT INTO model_training_sources (model_version, source_id)
-        SELECT ${input.version}, s.id FROM sources s
-        WHERE s.id = ANY(${idLiteral}::char(64)[])
-        ON CONFLICT DO NOTHING`;
-      recorded += result.count;
-    }
+    const inline = await tx`
+      INSERT INTO model_training_sources (model_version, source_id)
+      SELECT ${input.version}, s.id FROM sources s
+      WHERE s.id = ANY(${idArrayLiteral(input.trainingSourceIds)}::char(64)[])
+      ON CONFLICT DO NOTHING`;
+    // The pages sent ahead for this artifact join in the same transaction.
+    const paged = await tx`
+      INSERT INTO model_training_sources (model_version, source_id)
+      SELECT model_version, source_id FROM model_training_source_pages
+      WHERE model_version = ${input.version} AND model_sha256 = ${input.sha256}
+      ON CONFLICT DO NOTHING`;
+    await tx`DELETE FROM model_training_source_pages WHERE model_version = ${input.version}`;
     return {
       id: row.id as string,
       promotedAt: row.promoted_at as Date,
-      recorded,
+      recorded: inline.count + paged.count,
     };
   });
 
@@ -220,6 +235,40 @@ async function publish(req: Request, deps: ModelsDeps): Promise<Response> {
     },
     { status: 201 },
   );
+}
+
+// POST /api/models/training-sources — one page of a model's training
+// sources, sent before its publish (service key).
+export async function handlePostTrainingSourcePage(req: Request, deps: ModelsDeps): Promise<Response> {
+  const authed = authenticatePipeline(req, deps.pipelineKey);
+  if (authed) return authed;
+  const body = await readJsonObject(req, MAX_PUBLISH_BODY_BYTES);
+  if (body === null) return invalid("body must be a JSON object");
+  const { version, sha256, training_source_ids: trainingSourceIds } = body;
+  if (typeof version !== "string" || version.trim() === "" || version.length > MAX_VERSION_LEN) {
+    return invalid("version must be a non-empty string");
+  }
+  if (!isVideoId(sha256)) return invalid("sha256 must be a 64-char lowercase hex digest");
+  const read = readSourceIds(trainingSourceIds);
+  if ("error" in read) return invalid(read.error);
+
+  const [published] = await deps.sql`SELECT 1 FROM models WHERE version = ${version}`;
+  if (published) {
+    return errorResponse(409, "VERSION_EXISTS", "version is already published; bump the version instead");
+  }
+  const staged = await deps.sql`
+    INSERT INTO model_training_source_pages (model_version, model_sha256, source_id)
+    SELECT ${version}, ${sha256}, s.id FROM sources s
+    WHERE s.id = ANY(${idArrayLiteral(read.ids)}::char(64)[])
+    ON CONFLICT DO NOTHING`;
+  return Response.json({ version, training_sources_staged: staged.count });
+}
+
+/** Deletes training-source pages no publish consumed; run with the hourly retention jobs. */
+export async function purgeStaleTrainingSourcePages(sql: SQL): Promise<number> {
+  const result = await sql`
+    DELETE FROM model_training_source_pages WHERE staged_at < now() - ${STALE_PAGE_AGE}::interval`;
+  return result.count;
 }
 
 // GET /api/models/current — the current champion's manifest.
