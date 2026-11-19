@@ -193,6 +193,8 @@ async function* gzipBlocks(blocks: AsyncIterable<Uint8Array>): AsyncGenerator<Ui
     crc = crc32(block, crc);
     size += block.byteLength;
     yield new Uint8Array(deflateRawSync(block, { finishFlush: constants.Z_SYNC_FLUSH }));
+    // Already-buffered staged bytes keep this loop in microtasks; give requests a turn per block.
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
   const end = deflateRawSync(new Uint8Array(0));
   const trailer = new Uint8Array(end.byteLength + 8);

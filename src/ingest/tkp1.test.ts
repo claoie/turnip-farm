@@ -136,6 +136,19 @@ describe("canonicalizeStaged", () => {
     expect(() => Bun.gunzipSync(corrupt)).toThrow();
   });
 
+  test("other work runs while a large blob is transformed", async () => {
+    const gz = Bun.gzipSync(makeBlob(5000, 10, motion));
+    let ticks = 0;
+    const timer = setInterval(() => ticks++, 0);
+    try {
+      // The whole upload is buffered, so only the transform itself can yield.
+      await readAll(canonicalizeStaged(new Blob([gz]).stream()));
+    } finally {
+      clearInterval(timer);
+    }
+    expect(ticks).toBeGreaterThan(3);
+  });
+
   test("an interpolated NaN is written as one fixed NaN", async () => {
     const blob = makeBlob(5, 24, (i, k) => (k === 0 ? [i === 2 ? NaN : 0.5, 0.2, 0.9] : [0, 0, 0.9]));
     const view = new DataView(blob.buffer);
