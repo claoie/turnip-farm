@@ -3,9 +3,9 @@
 // label set of a clip, inside the same transaction as the clip upserts,
 // so a batch is all-or-nothing (§5). Blob verification is per distinct
 // source in the batch (§1.2.10) and runs BEFORE the transaction: the R2
-// fetch is network I/O that must not hold a DB connection, and it is
-// hard-capped at MAX_CANONICAL_BLOB_BYTES so one hostile blob can't
-// exhaust the farm process's memory. NULL digest → 422 BLOB_MISSING, digest
+// fetch is network I/O that must not hold a DB connection. The blob is
+// hashed as it streams, never held whole, and the read stops at
+// MAX_CANONICAL_BLOB_BYTES. NULL digest → 422 BLOB_MISSING, digest
 // mismatch against the stored bytes → 422 BLOB_DIGEST_MISMATCH, blob over
 // the cap → 422 BLOB_TOO_LARGE.
 
@@ -41,6 +41,9 @@ export interface ClipsDeps {
   /** The disclosure version clip writes require (§7.3 POST /api/consent). */
   currentDisclosureVersion: number;
 }
+
+/** About 3,000 clips; the app sends one source's clips per batch. */
+export const MAX_CLIPS_BODY_BYTES = 1024 * 1024;
 
 const notFound = () => errorResponse(404, "NOT_FOUND", "Not found");
 
@@ -104,8 +107,10 @@ function readClipInput(
   };
 }
 
-function sha256HexBytes(bytes: Uint8Array): string {
-  return new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+async function sha256HexStream(stream: ReadableStream<Uint8Array<ArrayBuffer>>): Promise<string> {
+  const hasher = new Bun.CryptoHasher("sha256");
+  for await (const chunk of stream) hasher.update(chunk);
+  return hasher.digest("hex");
 }
 
 async function replaceLabelSet(
@@ -140,7 +145,7 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
   const unconsented = await requireConsent(deps.sql, auth.userId, deps.currentDisclosureVersion);
   if (unconsented) return unconsented;
 
-  const body = await readJsonObject(req);
+  const body = await readJsonObject(req, MAX_CLIPS_BODY_BYTES);
   if (!Array.isArray(body?.clips)) return invalid("clips must be an array");
   const inputs: ClipInput[] = [];
   for (let i = 0; i < (body!.clips as unknown[]).length; i++) {
@@ -191,28 +196,27 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
   }
 
   // 3. Blob verification, once per distinct source (§1.2.10), still outside
-  //    the transaction. The fetch is bounded at MAX_CANONICAL_BLOB_BYTES
+  //    the transaction. The read is bounded at MAX_CANONICAL_BLOB_BYTES
   //    (POSE_FORMAT.md §8 sizing): a key-holding contributor can PUT an
-  //    arbitrarily large blob to their presigned staging URL, so an
-  //    unbounded buffer here would let one hostile blob exhaust the farm
-  //    process's memory while holding a DB connection.
+  //    arbitrarily large blob to their presigned staging URL.
   for (const [sourceId, s] of sources) {
     if (s.sha256 === null) {
       return errorResponse(422, "BLOB_MISSING", `source ${sourceId}: blob not ingested yet`, { details: {} });
     }
-    let bytes: Uint8Array | null;
+    let digest: string | null;
     try {
-      bytes = await deps.r2.getBytes(s.r2_key);
+      const body = await deps.r2.getStream(s.r2_key);
+      digest = body === null ? null : await sha256HexStream(body);
     } catch (e) {
       if (e instanceof BlobTooLargeError) {
         return errorResponse(422, "BLOB_TOO_LARGE", `source ${sourceId}: blob exceeds ${MAX_CANONICAL_BLOB_BYTES} bytes`, { details: {} });
       }
       throw e;
     }
-    if (bytes === null) {
+    if (digest === null) {
       return errorResponse(422, "BLOB_MISSING", `source ${sourceId}: blob not found at ${s.r2_key}`, { details: {} });
     }
-    if (sha256HexBytes(bytes) !== s.sha256) {
+    if (digest !== s.sha256) {
       return errorResponse(422, "BLOB_DIGEST_MISMATCH", `source ${sourceId}: stored blob digest mismatch`, { details: {} });
     }
   }

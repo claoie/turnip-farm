@@ -1,11 +1,11 @@
 // Conformance tests for the TKP1 codec and canonical resampling,
 // checked against the POSE_FORMAT.md §11 test vectors.
 import { describe, expect, test } from "bun:test";
+import { BlobTooLargeError } from "../r2/client";
 import {
+  canonicalizeStaged,
   decodeTkp1,
   encodeTkp1,
-  gunzipStaged,
-  gzipCanonical,
   isGapFrame,
   resampleToCanonical10Hz,
   Tkp1Error,
@@ -48,6 +48,17 @@ function section111(): Uint8Array<ArrayBuffer> {
   });
 }
 
+const MUTATIONS: [string, (b: Uint8Array<ArrayBuffer>) => Uint8Array<ArrayBuffer>][] = [
+  ["bad magic", (b: Uint8Array<ArrayBuffer>) => { b[0] = 0x58; return b; }],
+  ["format_version 2", (b: Uint8Array<ArrayBuffer>) => { b[4] = 2; return b; }],
+  ["keypoint_count 16", (b: Uint8Array<ArrayBuffer>) => { b[6] = 16; return b; }],
+  ["flags 1", (b: Uint8Array<ArrayBuffer>) => { b[20] = 1; return b; }],
+  ["frame_count 0", (b: Uint8Array<ArrayBuffer>) => { b[8] = 0; return b; }],
+  ["truncated", (b: Uint8Array<ArrayBuffer>) => b.slice(0, b.length - 10)],
+  ["trailing byte", (b: Uint8Array<ArrayBuffer>) => { const c = new Uint8Array(b.length + 1); c.set(b); return c; }],
+  ["empty", () => new Uint8Array(0)],
+];
+
 describe("TKP1 codec", () => {
   test("§11.1: encoder output digest matches the spec vector", () => {
     expect(sha256Hex(section111())).toBe(
@@ -70,40 +81,87 @@ describe("TKP1 codec", () => {
     expect(encodeTkp1(decodeTkp1(blob))).toEqual(blob);
   });
 
-  test.each([
-    ["bad magic", (b: Uint8Array<ArrayBuffer>) => { b[0] = 0x58; return b; }],
-    ["format_version 2", (b: Uint8Array<ArrayBuffer>) => { b[4] = 2; return b; }],
-    ["keypoint_count 16", (b: Uint8Array<ArrayBuffer>) => { b[6] = 16; return b; }],
-    ["flags 1", (b: Uint8Array<ArrayBuffer>) => { b[20] = 1; return b; }],
-    ["frame_count 0", (b: Uint8Array<ArrayBuffer>) => { b[8] = 0; return b; }],
-    ["truncated", (b: Uint8Array<ArrayBuffer>) => b.slice(0, b.length - 10)],
-    ["trailing byte", (b: Uint8Array<ArrayBuffer>) => { const c = new Uint8Array(b.length + 1); c.set(b); return c; }],
-    ["empty", () => new Uint8Array(0)],
-  ])("fail-closed on %s", (_, mutate) => {
+  test.each(MUTATIONS)("fail-closed on %s", (_, mutate) => {
     expect(() => decodeTkp1(mutate(section111()))).toThrow(Tkp1Error);
   });
 
-  test("gunzip rejects non-gzip", async () => {
-    await expect(gunzipStaged(new TextEncoder().encode("not gzip"))).rejects.toThrow(Tkp1Error);
+});
+
+// A staged upload as R2 hands it over: gzipped, in chunks of `chunk` bytes.
+function staged(gz: Uint8Array, chunk: number = 65536): ReadableStream<Uint8Array<ArrayBuffer>> {
+  let offset = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (offset >= gz.length) return controller.close();
+      controller.enqueue(gz.slice(offset, offset + chunk));
+      offset += chunk;
+    },
+  });
+}
+
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array<ArrayBuffer>> {
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+describe("canonicalizeStaged", () => {
+  // ~200 KB of frames: several of the 64 KiB blocks gzip is fed.
+  const motion = (i: number, k: number): Triple => [Math.sin(i / 7 + k) * 0.5, Math.cos(i / 5 + k) * 0.5, i % 13 === 0 ? 0 : 0.9];
+
+  test.each([
+    [10, 1000],
+    [30, 1000],
+    [24, 997],
+    [25, 1000],
+    [29.97, 1001],
+    [5, 400],
+    [1, 120],
+  ])("%p Hz: the batch transform's bytes, gzipped the same whatever the staged chunking", async (rate, n) => {
+    const blob = makeBlob(n, rate, motion);
+    const expected = encodeTkp1(resampleToCanonical10Hz(decodeTkp1(blob)));
+    const gz = Bun.gzipSync(blob);
+    const outputs = [];
+    for (const chunk of [7, 333, 65536, gz.length]) outputs.push(await readAll(canonicalizeStaged(staged(gz, chunk))));
+    expect(Bun.gunzipSync(outputs[0]!)).toEqual(expected);
+    for (const output of outputs.slice(1)) expect(output).toEqual(outputs[0]!);
   });
 
-  test("gunzip rejects output over maxBytes without expanding it", async () => {
+  test.each(MUTATIONS)("fail-closed on %s", async (_, mutate) => {
+    const gz = Bun.gzipSync(mutate(section111()));
+    await expect(readAll(canonicalizeStaged(staged(gz, 5)))).rejects.toBeInstanceOf(Tkp1Error);
+  });
+
+  test.each([0.5, 31])("rejects source rate %s Hz", async (r) => {
+    const gz = Bun.gzipSync(makeBlob(4, r, (i, k) => (k === 0 ? [i * 0.1, 0.5, 0.9] : [0, 0, 0])));
+    await expect(readAll(canonicalizeStaged(staged(gz)))).rejects.toBeInstanceOf(Tkp1Error);
+  });
+
+  test("rejects non-gzip", async () => {
+    await expect(readAll(canonicalizeStaged(staged(new TextEncoder().encode("not gzip"))))).rejects.toThrow(
+      "staged object is not valid gzip",
+    );
+  });
+
+  test("rejects output over maxBytes without expanding it", async () => {
     // 1,000 zero bytes gzip to ~30 bytes: a zip bomb in miniature. With a
-    // 10-byte cap the stream must fail once the expansion passes the cap,
-    // not after buffering the whole expansion.
+    // 10-byte cap the stream must fail once the expansion passes the cap.
     const bomb = Bun.gzipSync(new Uint8Array(1000));
-    await expect(gunzipStaged(bomb, { maxBytes: 10 })).rejects.toThrow(/exceeds 10 bytes/);
+    await expect(readAll(canonicalizeStaged(staged(bomb), { maxBytes: 10 }))).rejects.toThrow(/exceeds 10 bytes/);
   });
 
-  test("gunzip passes output under maxBytes through", async () => {
+  test("accepts a blob that decompresses to exactly maxBytes", async () => {
     const blob = section111();
-    await expect(gunzipStaged(Bun.gzipSync(blob), { maxBytes: blob.length })).resolves.toEqual(blob);
+    const out = await readAll(canonicalizeStaged(staged(Bun.gzipSync(blob)), { maxBytes: blob.length }));
+    expect(Bun.gunzipSync(out)).toEqual(blob);
   });
 
-  test("gzip is deterministic (mtime = 0), so re-ingest is idempotent", () => {
-    const blob = section111();
-    expect(gzipCanonical(blob)).toEqual(gzipCanonical(blob));
-    expect(sha256Hex(gzipCanonical(blob))).toBe(sha256Hex(gzipCanonical(blob)));
+  test("the staged stream's own error passes through as itself", async () => {
+    const failing = new ReadableStream<Uint8Array<ArrayBuffer>>({
+      start(controller) {
+        controller.enqueue(Bun.gzipSync(section111()).slice(0, 10));
+        controller.error(new BlobTooLargeError("staging/x.tkp1.gz", 10));
+      },
+    });
+    await expect(readAll(canonicalizeStaged(failing))).rejects.toBeInstanceOf(BlobTooLargeError);
   });
 });
 

@@ -9,6 +9,7 @@
 // transaction start, so every row a batch touches shares the exact same
 // updated_at.
 
+import { transaction } from "./db";
 import { errorResponse } from "./errors";
 import { authenticatePipeline, type PipelineDeps } from "./pipeline";
 import { isUuid } from "./contrib/validate";
@@ -21,9 +22,17 @@ export interface ExportDeps extends PipelineDeps {
    * exercises the exact production code path.
    */
   pageLimit?: number;
+  /** Rows read from the page's cursor at a time; tests lower it like pageLimit. */
+  fetchRows?: number;
 }
 
 export const EXPORT_PAGE_LIMIT = 10000;
+
+/**
+ * A page is read from a server-side cursor this many rows at a time and
+ * kept only as JSON text, so the page's row objects are never all alive.
+ */
+export const EXPORT_FETCH_ROWS = 1000;
 
 /**
  * The fewest distinct contributors a trick needs before turnip-ml trains
@@ -86,12 +95,9 @@ const FIRST_PAGE: Cursor = {
 // first, else as a canonical itself (§1.2.25), so a name accepted
 // through a canonical with no raw row of its own, or typed with odd
 // spacing or case, still maps. No match: null.
-async function selectRows(
-  sql: ExportDeps["sql"],
-  cursor: Cursor,
-  limit: number,
-): Promise<Record<string, any>[]> {
-  return (await sql`
+async function declareRowCursor(tx: ExportDeps["sql"], cursor: Cursor, limit: number): Promise<void> {
+  await tx`
+    DECLARE export_rows NO SCROLL CURSOR FOR
     WITH raw_map AS (
       SELECT DISTINCT ON (n) n, canonical
       FROM (SELECT lower(regexp_replace(btrim(raw, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g')) AS n,
@@ -137,7 +143,26 @@ async function selectRows(
       AND (GREATEST(s.updated_at, c.updated_at, l.updated_at), c.id, l.trick_name)
           > (${cursor.rowCursor}::timestamptz, ${cursor.clipId}::uuid, ${cursor.trickName})
     ORDER BY row_cursor ASC, clip_id ASC, trick_name ASC
-    LIMIT ${limit}`) as Record<string, any>[];
+    LIMIT ${limit}`;
+}
+
+function exportRow(r: Record<string, any>) {
+  return {
+    source_id: r.source_id,
+    r2_key: r.r2_key,
+    blob_sha256: r.blob_sha256,
+    holdout: r.holdout,
+    clip_id: r.clip_id,
+    start_frame: r.start_frame,
+    end_frame: r.end_frame,
+    proposal_model_version: r.proposal_model_version,
+    suggested_names: r.suggested_names,
+    suggestions_withheld: r.suggestions_withheld,
+    trick_name: r.trick_name,
+    canonical: r.canonical,
+    origin: r.origin,
+    taxonomy_version: r.taxonomy_version,
+  };
 }
 
 // GET /api/labels/export?since= — training pull (service key).
@@ -154,7 +179,20 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
     cursor = decoded;
   }
 
-  const rows = await selectRows(deps.sql, cursor, limit);
+  const fetchRows = deps.fetchRows ?? EXPORT_FETCH_ROWS;
+  const page = await transaction(deps.sql, async (tx) => {
+    await declareRowCursor(tx, cursor, limit);
+    const json: string[] = [];
+    let last: Record<string, any> | undefined;
+    for (;;) {
+      const rows = (await tx.unsafe(`FETCH ${fetchRows} FROM export_rows`)) as Record<string, any>[];
+      if (rows.length === 0) break;
+      json.push(rows.map((r) => JSON.stringify(exportRow(r))).join(","));
+      last = rows[rows.length - 1];
+    }
+    await tx.unsafe("CLOSE export_rows");
+    return { json, last };
+  });
 
   // The whole label_taxonomy table, not just the versions present in rows:
   // a raw string mapped only at an old version would otherwise silently
@@ -204,24 +242,9 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
     GROUP BY 1
     ORDER BY 1`) as { canonical: string; contributors: number }[];
 
-  const last = rows[rows.length - 1];
-  return Response.json({
-    rows: rows.map((r) => ({
-      source_id: r.source_id,
-      r2_key: r.r2_key,
-      blob_sha256: r.blob_sha256,
-      holdout: r.holdout,
-      clip_id: r.clip_id,
-      start_frame: r.start_frame,
-      end_frame: r.end_frame,
-      proposal_model_version: r.proposal_model_version,
-      suggested_names: r.suggested_names,
-      suggestions_withheld: r.suggestions_withheld,
-      trick_name: r.trick_name,
-      canonical: r.canonical,
-      origin: r.origin,
-      taxonomy_version: r.taxonomy_version,
-    })),
+  // The bytes Response.json would write, sent one fetched batch at a time.
+  const { json, last } = page;
+  const tail = JSON.stringify({
     taxonomy: taxonomy.map((t) => ({
       raw: t.raw,
       canonical: t.canonical,
@@ -234,4 +257,16 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
     // empty request per pull.
     next_cursor: last ? encodeCursor(last.row_cursor_iso as string, last.clip_id, last.trick_name) : null,
   });
+  const chunks = ['{"rows":[', ...json.map((part, i) => (i === 0 ? part : `,${part}`)), `],${tail.slice(1)}`];
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream<Uint8Array<ArrayBuffer>>({
+      pull(controller) {
+        const chunk = chunks.shift();
+        if (chunk === undefined) controller.close();
+        else controller.enqueue(encoder.encode(chunk));
+      },
+    }),
+    { headers: { "Content-Type": "application/json;charset=utf-8" } },
+  );
 }

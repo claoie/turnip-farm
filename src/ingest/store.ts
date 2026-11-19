@@ -2,18 +2,31 @@
 // implementation. The ingest worker only depends on BlobStore, so tests
 // substitute an in-memory fake.
 
-import { BlobTooLargeError, MAX_CANONICAL_BLOB_BYTES } from "../r2/client";
+import { cappedBody, capStream, MAX_CANONICAL_BLOB_BYTES } from "../r2/client";
 
 export interface StoredObject {
-  bytes: Uint8Array<ArrayBuffer>;
+  /**
+   * The object's bytes, capped at the store's maxBytes: past it the
+   * stream errors with BlobTooLargeError (get rejects with it outright
+   * when the declared length is already over).
+   */
+  body: ReadableStream<Uint8Array<ArrayBuffer>>;
   // Base64 SHA-256 the object was stored with (x-amz-checksum-sha256),
   // when the object carries one.
   checksumSha256: string | null;
 }
 
+export interface BlobUpload {
+  body: ReadableStream<Uint8Array<ArrayBuffer>>;
+  /** Exact byte length of `body`. */
+  size: number;
+  /** SHA-256 of `body`; the store refuses the write when the bytes differ. */
+  sha256: Uint8Array<ArrayBuffer>;
+}
+
 export interface BlobStore {
   get(key: string): Promise<StoredObject | null>;
-  put(key: string, bytes: Uint8Array<ArrayBuffer>, contentType: string): Promise<void>;
+  put(key: string, upload: BlobUpload, contentType: string): Promise<void>;
   delete(key: string): Promise<void>;
   /**
    * List keys under `prefix`, one listing page at a time. Callers must
@@ -62,6 +75,8 @@ async function sha256HexBytes(data: Uint8Array<ArrayBuffer>): Promise<string> {
   return Buffer.from(digest).toString("hex");
 }
 
+const EMPTY_PAYLOAD_SHA256 = new Bun.CryptoHasher("sha256").digest("hex");
+
 function encodePathSegment(s: string): string {
   return encodeURIComponent(s).replaceAll("%7E", "~");
 }
@@ -80,12 +95,11 @@ async function signRequest(
   key: string | null, // null for bucket-level (list) operations
   query: Record<string, string>,
   extraHeaders: Record<string, string>,
-  payload: Uint8Array<ArrayBuffer> | null,
+  payloadHash: string,
   now: Date,
 ): Promise<SignedRequest> {
   const { amzDate, dateStamp } = amzDates(now);
   const host = `${cfg.accountId}.r2.cloudflarestorage.com`;
-  const payloadHash = payload ? await sha256HexBytes(payload) : await sha256HexBytes(new Uint8Array(0));
 
   const path = key === null ? `/${cfg.bucket}` : `/${cfg.bucket}/${key.split("/").map(encodePathSegment).join("/")}`;
   const queryNames = Object.keys(query).sort();
@@ -142,68 +156,39 @@ export class R2BlobStore implements BlobStore {
   }
 
   async get(key: string): Promise<StoredObject | null> {
-    const { url, headers } = await signRequest(this.cfg, "GET", key, {}, {}, null, this.now());
+    const { url, headers } = await signRequest(this.cfg, "GET", key, {}, {}, EMPTY_PAYLOAD_SHA256, this.now());
     const res = await this.doFetch(url, { method: "GET", headers });
     if (res.status === 404) return null;
     if (!res.ok) throw new R2Error(res.status, "GET", await res.text());
-    // Stream with a running total instead of res.arrayBuffer(): the staged
-    // object is the uploader-controlled blob the threat model names
-    // (presigned PUTs cannot enforce content-length), so an unbounded read
-    // lets one oversized upload exhaust the farm process's memory. The cap
-    // reuses MAX_CANONICAL_BLOB_BYTES — a staged upload is at most 3x the
-    // canonical rate, so 64 MiB still covers ~3 hours of footage — and
-    // mirrors the canonical path's getBytes, including its content-length
-    // fast path (headers can lie, so the stream is still counted).
-    const declared = res.headers.get("content-length");
-    if (declared !== null && Number(declared) > this.maxBytes) {
-      await res.body?.cancel().catch(() => {});
-      throw new BlobTooLargeError(key, this.maxBytes);
-    }
-    const reader = res.body?.getReader();
-    if (!reader) {
-      return {
-        bytes: new Uint8Array(await res.arrayBuffer()),
-        checksumSha256: res.headers.get("x-amz-checksum-sha256"),
-      };
-    }
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > this.maxBytes) {
-        await reader.cancel().catch(() => {});
-        throw new BlobTooLargeError(key, this.maxBytes);
-      }
-      chunks.push(value);
-    }
-    const bytes = new Uint8Array(total);
-    let off = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, off);
-      off += chunk.byteLength;
-    }
+    // The staged object is the uploader-controlled blob the threat model
+    // names (presigned PUTs cannot enforce content-length). The cap reuses
+    // MAX_CANONICAL_BLOB_BYTES — a staged upload is at most 3x the
+    // canonical rate, so 64 MiB still covers ~3 hours of footage.
     return {
-      bytes,
+      body: cappedBody(res, key, this.maxBytes),
       checksumSha256: res.headers.get("x-amz-checksum-sha256"),
     };
   }
 
-  async put(key: string, bytes: Uint8Array<ArrayBuffer>, contentType: string): Promise<void> {
-    // Ship the SHA-256 as the object's checksum: transport integrity on the
-    // canonical write, and a verifiable value for future GETs.
-    const checksum = Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("base64");
+  // The declared length and digest let R2 verify the streamed body: the
+  // SigV4 payload hash and the stored checksum are both the body's SHA-256.
+  async put(key: string, upload: BlobUpload, contentType: string): Promise<void> {
+    const payloadHash = Buffer.from(upload.sha256).toString("hex");
     const { url, headers } = await signRequest(this.cfg, "PUT", key, {}, {
       "content-type": contentType,
-      "x-amz-checksum-sha256": checksum,
-    }, bytes, this.now());
-    const res = await this.doFetch(url, { method: "PUT", headers, body: bytes });
+      "x-amz-checksum-sha256": Buffer.from(upload.sha256).toString("base64"),
+    }, payloadHash, this.now());
+    const body = capStream(upload.body, upload.size, () => new Error(`R2 PUT ${key}: body exceeds ${upload.size} bytes`));
+    const res = await this.doFetch(url, {
+      method: "PUT",
+      headers: { ...headers, "content-length": String(upload.size) },
+      body,
+    });
     if (!res.ok) throw new R2Error(res.status, "PUT", await res.text());
   }
 
   async delete(key: string): Promise<void> {
-    const { url, headers } = await signRequest(this.cfg, "DELETE", key, {}, {}, null, this.now());
+    const { url, headers } = await signRequest(this.cfg, "DELETE", key, {}, {}, EMPTY_PAYLOAD_SHA256, this.now());
     const res = await this.doFetch(url, { method: "DELETE", headers });
     if (res.status !== 404 && !res.ok) throw new R2Error(res.status, "DELETE", await res.text());
   }
@@ -219,7 +204,7 @@ export class R2BlobStore implements BlobStore {
     for (;;) {
       const query: Record<string, string> = { "list-type": "2", prefix, "max-keys": "1000" };
       if (continuation !== undefined) query["continuation-token"] = continuation;
-      const { url, headers } = await signRequest(this.cfg, "GET", null, query, {}, null, this.now());
+      const { url, headers } = await signRequest(this.cfg, "GET", null, query, {}, EMPTY_PAYLOAD_SHA256, this.now());
       const res = await this.doFetch(url, { method: "GET", headers });
       if (!res.ok) throw new R2Error(res.status, "LIST", await res.text());
       const xml = await res.text();

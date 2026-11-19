@@ -181,20 +181,21 @@ export async function handleGetAdminSourcePose(
   if (source.sha256 === null) {
     return errorResponse(422, "BLOB_MISSING", "The pose blob is not ingested yet");
   }
-  let bytes: Uint8Array | null;
+  let body: ReadableStream<Uint8Array<ArrayBuffer>> | null;
   try {
-    bytes = await deps.r2.getBytes(source.r2_key as string, { maxBytes: MAX_CANONICAL_BLOB_BYTES });
+    body = await deps.r2.getStream(source.r2_key as string, { maxBytes: MAX_CANONICAL_BLOB_BYTES });
   } catch (err) {
     if (err instanceof BlobTooLargeError) {
       return errorResponse(422, "BLOB_TOO_LARGE", `The pose blob exceeds ${MAX_CANONICAL_BLOB_BYTES} bytes`);
     }
     throw err;
   }
-  if (bytes === null) {
+  if (body === null) {
     return errorResponse(422, "BLOB_MISSING", "The pose blob is not in storage");
   }
-  // getBytes assembles the body into a fresh ArrayBuffer-backed array.
-  return new Response(bytes as Uint8Array<ArrayBuffer>, {
+  // The response pulls from R2 as the browser reads. A body over the cap
+  // that didn't declare its length errors mid-stream, cutting the response short.
+  return new Response(body, {
     headers: {
       ...NO_STORE,
       "Content-Type": "application/gzip",

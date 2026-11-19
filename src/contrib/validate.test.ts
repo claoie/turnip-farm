@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  BodyTooLargeError,
   isSourceKey,
   isUuid,
   isVideoId,
   provenanceProblem,
+  MAX_JSON_BODY_BYTES,
   readJsonObject,
   readLabels,
   readProvenance,
@@ -164,5 +166,69 @@ describe("readJsonObject", () => {
 
   test("empty body returns null", async () => {
     expect(await readJsonObject(post())).toBeNull();
+  });
+
+  // A streamed body carries no content-length, so only the running count can stop it.
+  const streamed = (chunks: string[], onPull: () => void = () => {}) => {
+    let i = 0;
+    return new Request("http://localhost/contrib", {
+      method: "POST",
+      body: new ReadableStream<Uint8Array<ArrayBuffer>>({
+        pull(controller) {
+          onPull();
+          if (i < chunks.length) controller.enqueue(new TextEncoder().encode(chunks[i++]!));
+          else controller.close();
+        },
+      }),
+    });
+  };
+
+  test("a declared length over the cap throws before reading", async () => {
+    const req = new Request("http://localhost/contrib", {
+      method: "POST",
+      headers: { "content-length": "11" },
+      body: "{}",
+    });
+    const err = await readJsonObject(req, 10).catch((e) => e);
+    expect(err).toBeInstanceOf(BodyTooLargeError);
+    expect((err as BodyTooLargeError).maxBytes).toBe(10);
+    expect(req.bodyUsed).toBe(false);
+  });
+
+  test("a streamed body throws once the bytes read pass the cap, and is read no further", async () => {
+    let pulls = 0;
+    const chunks = ['{"a":"', "x".repeat(8), "x".repeat(8), "x".repeat(8), '"}'];
+    await expect(readJsonObject(streamed(chunks, () => pulls++), 16)).rejects.toBeInstanceOf(BodyTooLargeError);
+    expect(pulls).toBeLessThan(chunks.length);
+  });
+
+  test("a body of exactly the cap is read", async () => {
+    const body = JSON.stringify({ a: "x".repeat(10) });
+    expect(await readJsonObject(post(body), body.length)).toEqual({ a: "x".repeat(10) });
+  });
+
+  test("defaults to MAX_JSON_BODY_BYTES", async () => {
+    const at = JSON.stringify({ a: "x".repeat(MAX_JSON_BODY_BYTES - 8) });
+    expect(at.length).toBe(MAX_JSON_BODY_BYTES);
+    expect(await readJsonObject(post(at))).not.toBeNull();
+    await expect(readJsonObject(post(`${at} `))).rejects.toBeInstanceOf(BodyTooLargeError);
+  });
+
+  test("UTF-8 split across chunks decodes intact", async () => {
+    const bytes = new TextEncoder().encode(JSON.stringify({ name: "ñandú" }));
+    const split = bytes.indexOf(0xc3) + 1; // inside the two-byte ñ
+    let sent = 0;
+    const req = new Request("http://localhost/contrib", {
+      method: "POST",
+      body: new ReadableStream<Uint8Array<ArrayBuffer>>({
+        pull(controller) {
+          if (sent === 0) controller.enqueue(bytes.slice(0, split));
+          else if (sent === 1) controller.enqueue(bytes.slice(split));
+          else controller.close();
+          sent++;
+        },
+      }),
+    });
+    expect(await readJsonObject(req)).toEqual({ name: "ñandú" });
   });
 });

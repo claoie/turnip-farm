@@ -29,7 +29,7 @@ const noR2: R2Client = {
   presignGet: () => {
     throw new Error("not used");
   },
-  getBytes: () => {
+  getStream: () => {
     throw new Error("not used");
   },
   deleteObject: () => {

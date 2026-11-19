@@ -13,12 +13,13 @@ import {
   handleGetSourcePose,
   handleRegisterSource,
 } from "./contrib/sources";
-import { handlePostClipLabels, handlePostClips } from "./contrib/clips";
+import { MAX_CLIPS_BODY_BYTES, handlePostClipLabels, handlePostClips } from "./contrib/clips";
 import { handleGetLabelsExport } from "./export";
 import { handleGetTaxonomyCurrent } from "./taxonomy";
-import { handleGetModelsCurrent, handlePostModels } from "./models";
+import { MAX_PUBLISH_BODY_BYTES, handleGetModelsCurrent, handlePostModels } from "./models";
 import { handleGetStats } from "./stats";
 import {
+  MAX_QUARANTINE_BODY_BYTES,
   handlePostQuarantine,
   handlePurgeQuarantine,
   handleReleaseQuarantine,
@@ -36,7 +37,7 @@ import {
   handleAuthEvents,
 } from "./auth/admin";
 import { errorResponse } from "./errors";
-import { isVideoId } from "./contrib/validate";
+import { BodyTooLargeError, MAX_JSON_BODY_BYTES, isVideoId } from "./contrib/validate";
 import type { R2Client } from "./r2/client";
 import { type ProxyRange, TokenBucket, clientAddress } from "./ratelimit";
 
@@ -121,7 +122,7 @@ async function isFile(path: string): Promise<boolean> {
 }
 
 export function createHandler(deps: AppDeps, opts: HandlerOptions = {}): (req: Request) => Promise<Response> {
-  return async (req) => {
+  const route = async (req: Request): Promise<Response> => {
     const pathname = new URL(req.url).pathname;
     const seg = pathname.split("/").filter(Boolean);
     const method = req.method;
@@ -225,12 +226,24 @@ export function createHandler(deps: AppDeps, opts: HandlerOptions = {}): (req: R
     }
     return errorResponse(404, "NOT_FOUND", "Not found");
   };
+  return async (req) => {
+    try {
+      return await route(req);
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) {
+        return errorResponse(422, "VALIDATION_ERROR", err.message, { details: { maxBytes: err.maxBytes } });
+      }
+      throw err;
+    }
+  };
 }
 
 export function startServer(port: number, deps: AppDeps, opts: HandlerOptions = {}) {
   const handle = createHandler(deps, opts);
   return Bun.serve({
     port,
+    // Bun's default is 128 MiB; no route reads more than its own cap.
+    maxRequestBodySize: Math.max(MAX_JSON_BODY_BYTES, MAX_CLIPS_BODY_BYTES, MAX_PUBLISH_BODY_BYTES, MAX_QUARANTINE_BODY_BYTES),
     fetch(req, server) {
       const clientIp = () =>
         clientAddress(

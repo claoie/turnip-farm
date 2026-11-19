@@ -32,7 +32,7 @@ const noR2: R2Client = {
   presignGet: () => {
     throw new Error("r2 unavailable in this test");
   },
-  getBytes: () => {
+  getStream: () => {
     throw new Error("r2 unavailable in this test");
   },
   deleteObject: () => {
@@ -354,16 +354,25 @@ describeDb("PUT and DELETE /api/admin/sources/:id/holdout", () => {
     }));
 });
 
-function fakeR2(getBytes: R2Client["getBytes"]): R2Client & { fetched: string[] } {
+function fakeR2(getStream: R2Client["getStream"]): R2Client & { fetched: string[] } {
   const fetched: string[] = [];
   return {
     ...noR2,
     fetched,
-    getBytes: (key, opts) => {
+    getStream: (key, opts) => {
       fetched.push(key);
-      return getBytes(key, opts);
+      return getStream(key, opts);
     },
   };
+}
+
+function streamOf(...chunks: Uint8Array<ArrayBuffer>[]): ReadableStream<Uint8Array<ArrayBuffer>> {
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
 }
 
 describeDb("GET /api/admin/sources/:id/pose", () => {
@@ -375,7 +384,7 @@ describeDb("GET /api/admin/sources/:id/pose", () => {
       let cap: number | undefined;
       const r2 = fakeR2(async (_key, opts) => {
         cap = opts?.maxBytes;
-        return blob;
+        return streamOf(blob.slice(0, 3), blob.slice(3));
       });
       const res = await dbDeps(tx, { r2 })(req("GET", `/api/admin/sources/${SOURCE}/pose`, asAdmin));
       expect(res.status).toBe(200);
@@ -412,6 +421,23 @@ describeDb("GET /api/admin/sources/:id/pose", () => {
       })(req("GET", `/api/admin/sources/${SOURCE}/pose`, asAdmin));
       expect(huge.status).toBe(422);
       expect(((await huge.json()) as any).error.code).toBe("BLOB_TOO_LARGE");
+    }));
+
+  test("a blob that passes the cap mid-stream cuts the response short", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const asAdmin = await adminHeaders(tx);
+      await seedSource(tx, SOURCE);
+      const r2 = fakeR2(async (key) =>
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new Uint8Array([0x1f, 0x8b]));
+            controller.error(new BlobTooLargeError(key, 2));
+          },
+        }),
+      );
+      const res = await dbDeps(tx, { r2 })(req("GET", `/api/admin/sources/${SOURCE}/pose`, asAdmin));
+      expect(res.status).toBe(200);
+      await expect(res.arrayBuffer()).rejects.toBeInstanceOf(BlobTooLargeError);
     }));
 
   test("404 for an unknown or malformed source id", async () =>

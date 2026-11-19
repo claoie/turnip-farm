@@ -28,7 +28,7 @@ const stubR2: R2Client = {
     throw new Error("r2 put touched");
   },
   presignGet: (key: string) => ({ url: `https://r2.test/${key}?sig=x`, expiresAt: new Date() }),
-  getBytes: () => {
+  getStream: () => {
     throw new Error("r2 get touched");
   },
   deleteObject: () => {
@@ -304,6 +304,29 @@ describe.skipIf(!TEST_DATABASE_URL)("model registry, DB-backed", () => {
       expect(Array.isArray(manifest.vocabulary)).toBe(true);
       expect((manifest.vocabulary as unknown[]).length).toBeGreaterThan(0);
       expect(current.headers.get("ETag")).toBe('"trick-v1.2"');
+    });
+  });
+
+  test("records training sources past the first insert batch", async () => {
+    await inRollback(sql, async (tx) => {
+      const d: ModelsDeps = { sql: tx, pipelineKey: PIPELINE_KEY, r2: stubR2 };
+      // 10,001 ids cross the 10,000-id insert batch; live sources sit at both ends.
+      const ids = Array.from({ length: 10001 }, (_, i) => i.toString(16).padStart(64, "0"));
+      const live = [ids[0]!, ids[10000]!];
+      for (const id of live) {
+        await tx`
+          INSERT INTO sources (id, source_key_hash, frame_count, sample_rate, r2_key)
+          VALUES (${id}, ${"f".repeat(64)}, 600, 30, ${`poses/${id}.tkp1.gz`})`;
+      }
+      const res = await handlePostModels(
+        postReq({ ...validBody(), version: "trick-v1.4", training_source_ids: ids }),
+        d,
+      );
+      expect(res.status).toBe(201);
+      expect(((await res.json()) as Record<string, unknown>).training_sources_recorded).toBe(2);
+      const membership = await tx`
+        SELECT source_id FROM model_training_sources WHERE model_version = 'trick-v1.4' ORDER BY source_id`;
+      expect(membership.map((r: { source_id: string }) => r.source_id)).toEqual(live);
     });
   });
 

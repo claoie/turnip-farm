@@ -19,12 +19,48 @@ export const isSourceKey = (s: unknown): s is string =>
 export const isUuid = (s: unknown): s is string =>
   typeof s === "string" && UUID_RE.test(s);
 
-/** Parses a JSON object body; null when the body is not a JSON object. */
-export async function readJsonObject(req: Request): Promise<Record<string, unknown> | null> {
+/**
+ * The largest request body a route reads unless it names its own cap. A
+ * parsed body costs many times its size (each 3-byte `{},` is a whole
+ * object), so a cap follows what clients send, not the memory left over.
+ */
+export const MAX_JSON_BODY_BYTES = 64 * 1024;
+
+/** Thrown by readJsonObject past the route's cap; the app answers 422 VALIDATION_ERROR. */
+export class BodyTooLargeError extends Error {
+  constructor(readonly maxBytes: number) {
+    super(`The request body exceeds ${maxBytes} bytes`);
+    this.name = "BodyTooLargeError";
+  }
+}
+
+/**
+ * Parses a JSON object body of at most `maxBytes`; null when the body is
+ * not a JSON object. The body is read as it arrives and abandoned at the
+ * cap, so an oversized one is never held whole.
+ */
+export async function readJsonObject(
+  req: Request,
+  maxBytes: number = MAX_JSON_BODY_BYTES,
+): Promise<Record<string, unknown> | null> {
+  const declared = req.headers.get("content-length");
+  if (declared !== null && Number(declared) > maxBytes) throw new BodyTooLargeError(maxBytes);
   let body: unknown;
   try {
-    body = await req.json();
-  } catch {
+    let text = "";
+    if (req.body) {
+      const decoder = new TextDecoder();
+      let total = 0;
+      for await (const chunk of req.body) {
+        total += chunk.byteLength;
+        if (total > maxBytes) throw new BodyTooLargeError(maxBytes);
+        text += decoder.decode(chunk, { stream: true });
+      }
+      text += decoder.decode();
+    }
+    body = JSON.parse(text);
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) throw err;
     return null;
   }
   return typeof body === "object" && body !== null && !Array.isArray(body)

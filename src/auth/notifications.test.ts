@@ -52,7 +52,7 @@ function fakeR2(opts: { failDelete?: boolean } = {}): R2Client & { deleted: stri
     presignGet: () => {
       throw new Error("not used");
     },
-    getBytes: () => {
+    getStream: () => {
       throw new Error("not used");
     },
     deleteObject: async (key: string) => {

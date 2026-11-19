@@ -12,6 +12,7 @@
 
 import type { SQL } from "bun";
 import type { JWTPayload } from "jose";
+import { readJsonObject } from "../contrib/validate";
 import { errorResponse } from "../errors";
 import type { R2Client } from "../r2/client";
 import { InvalidTokenError, type VerifyAppleJwt } from "./apple";
@@ -26,7 +27,7 @@ export interface NotificationsDeps {
 }
 
 export async function handleAppleNotifications(req: Request, deps: NotificationsDeps): Promise<Response> {
-  const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const body = await readJsonObject(req);
   const payload = body?.payload;
   if (typeof payload !== "string" || payload === "") {
     return errorResponse(422, "VALIDATION_ERROR", "payload must be a non-empty string");

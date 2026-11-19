@@ -117,7 +117,7 @@ describeDb("blocking", () => {
     presignGet: () => {
       throw new Error("not used");
     },
-    getBytes: () => {
+    getStream: () => {
       throw new Error("not used");
     },
     deleteObject: () => {

@@ -2,6 +2,7 @@
 // once, at sign-in; every other request carries an opaque farm session token.
 
 import type { SQL } from "bun";
+import { readJsonObject } from "../contrib/validate";
 import { transaction } from "../db";
 import { errorResponse } from "../errors";
 import { AppleUnavailableError, type ExchangeCode, InvalidTokenError, type VerifyIdentityToken } from "./apple";
@@ -131,9 +132,9 @@ function unauthenticated(message: string): Response {
 async function readSignInBody(
   req: Request,
 ): Promise<{ identity_token: string; authorization_code: string; nonce: string } | null> {
-  const body: unknown = await req.json().catch(() => null);
-  if (typeof body !== "object" || body === null) return null;
-  const { identity_token, authorization_code, nonce } = body as Record<string, unknown>;
+  const body = await readJsonObject(req);
+  if (body === null) return null;
+  const { identity_token, authorization_code, nonce } = body;
   for (const field of [identity_token, authorization_code, nonce]) {
     if (typeof field !== "string" || field === "") return null;
   }

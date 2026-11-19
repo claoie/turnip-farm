@@ -14,20 +14,19 @@ export interface R2Client {
   presignPut(key: string): PresignedUrl;
   presignGet(key: string): PresignedUrl;
   /**
-   * Object bytes, or null when the key does not exist.
-   * The download is hard-capped at `opts.maxBytes` (default
-   * MAX_CANONICAL_BLOB_BYTES): a key-holding contributor can PUT an
-   * arbitrarily large blob to their presigned staging URL (presigned PUTs
-   * cannot enforce content-length), so an unbounded read would let one
-   * hostile blob exhaust the farm process's memory. Throws
-   * BlobTooLargeError when the cap is exceeded.
+   * The object's bytes as a stream, or null when the key does not exist.
+   * Hard-capped at `opts.maxBytes` (default MAX_CANONICAL_BLOB_BYTES): a
+   * key-holding contributor can PUT an arbitrarily large blob to their
+   * presigned staging URL (presigned PUTs cannot enforce content-length).
+   * Rejects with BlobTooLargeError when the declared length is over the
+   * cap, and errors the stream with it once the bytes read pass the cap.
    */
-  getBytes(key: string, opts?: { maxBytes?: number }): Promise<Uint8Array | null>;
+  getStream(key: string, opts?: { maxBytes?: number }): Promise<ReadableStream<Uint8Array<ArrayBuffer>> | null>;
   /** Deleting a missing key is a no-op. */
   deleteObject(key: string): Promise<void>;
 }
 
-/** Thrown by getBytes when the blob exceeds the caller's maxBytes. */
+/** Thrown, or raised by the stream, when a blob exceeds the reader's maxBytes. */
 export class BlobTooLargeError extends Error {
   constructor(
     readonly key: string,
@@ -39,14 +38,47 @@ export class BlobTooLargeError extends Error {
 }
 
 /**
- * Largest canonical blob the farm will buffer. Judgment call, grounded in
- * POSE_FORMAT.md §8: a canonical blob is ~2,040 bytes/s at 10 Hz (≈122 KB
+ * Largest canonical blob the farm reads or stores. Judgment call, grounded
+ * in POSE_FORMAT.md §8: a canonical blob is ~2,040 bytes/s at 10 Hz (≈122 KB
  * for a 60-second session, gzip shrinking a further 5–25%), so 64 MiB is
  * roughly ten hours of tricking footage — two orders of magnitude above any
- * legit session. Anything larger is never legit, and the farm process must
- * never buffer more than this.
+ * legit session. Anything larger is never legit. Blobs are streamed, never
+ * held whole, so the cap bounds bytes moved, not memory.
  */
 export const MAX_CANONICAL_BLOB_BYTES = 64 * 1024 * 1024;
+
+/**
+ * A blob download's body, capped at `maxBytes` without buffering it.
+ * The declared length is checked first; headers can lie, so the bytes
+ * are still counted as they pass, and the stream errors past the cap.
+ */
+export function cappedBody(res: Response, key: string, maxBytes: number): ReadableStream<Uint8Array<ArrayBuffer>> {
+  const declared = res.headers.get("content-length");
+  if (declared !== null && Number(declared) > maxBytes) {
+    void res.body?.cancel().catch(() => {});
+    throw new BlobTooLargeError(key, maxBytes);
+  }
+  const body = res.body ?? new ReadableStream<Uint8Array<ArrayBuffer>>({ start: (controller) => controller.close() });
+  return capStream(body, maxBytes, () => new BlobTooLargeError(key, maxBytes));
+}
+
+/** `body`, erroring with `tooLarge()` (and cancelling `body`) once more than `maxBytes` pass through. */
+export function capStream(
+  body: ReadableStream<Uint8Array<ArrayBuffer>>,
+  maxBytes: number,
+  tooLarge: () => Error,
+): ReadableStream<Uint8Array<ArrayBuffer>> {
+  let total = 0;
+  return body.pipeThrough(
+    new TransformStream<Uint8Array<ArrayBuffer>, Uint8Array<ArrayBuffer>>({
+      transform(chunk, controller) {
+        total += chunk.byteLength;
+        if (total > maxBytes) controller.error(tooLarge());
+        else controller.enqueue(chunk);
+      },
+    }),
+  );
+}
 
 export function createR2Client(
   cfg: R2Config,
@@ -57,42 +89,13 @@ export function createR2Client(
   return {
     presignPut: (key) => presignPut(cfg, key, now()),
     presignGet: (key) => presignGet(cfg, key, now()),
-    getBytes: async (key, opts = {}) => {
+    getStream: async (key, opts = {}) => {
       const maxBytes = opts.maxBytes ?? MAX_CANONICAL_BLOB_BYTES;
       const { url } = presignUrl(cfg, "GET", key, 60, now());
       const res = await doFetch(url);
       if (res.status === 404) return null;
       if (!res.ok) throw new Error(`R2 GET ${key} failed: ${res.status}`);
-      // Fast path: the declared length already exceeds the cap. Headers can
-      // lie, so the stream is still counted below.
-      const declared = res.headers.get("content-length");
-      if (declared !== null && Number(declared) > maxBytes) {
-        await res.body?.cancel().catch(() => {});
-        throw new BlobTooLargeError(key, maxBytes);
-      }
-      // Stream with a running total instead of res.arrayBuffer(): the body
-      // is untrusted and arrayBuffer() buffers it unboundedly.
-      const reader = res.body?.getReader();
-      if (!reader) return new Uint8Array(await res.arrayBuffer());
-      const chunks: Uint8Array[] = [];
-      let total = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        total += value.byteLength;
-        if (total > maxBytes) {
-          await reader.cancel().catch(() => {});
-          throw new BlobTooLargeError(key, maxBytes);
-        }
-        chunks.push(value);
-      }
-      const out = new Uint8Array(total);
-      let off = 0;
-      for (const chunk of chunks) {
-        out.set(chunk, off);
-        off += chunk.byteLength;
-      }
-      return out;
+      return cappedBody(res, key, maxBytes);
     },
     deleteObject: async (key) => {
       const { url } = presignUrl(cfg, "DELETE", key, 60, now());

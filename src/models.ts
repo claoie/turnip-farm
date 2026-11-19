@@ -33,6 +33,10 @@ const MAX_CLIENT_VERSION_LEN = 50;
 const MAX_REPORT_KEY_LEN = 1024;
 const MAX_RUN_ID_LEN = 200;
 const MAX_SOURCE_IDS = 100000;
+/** MAX_SOURCE_IDS quoted ids at 67 bytes each, with room for the metrics. */
+export const MAX_PUBLISH_BODY_BYTES = 8 * 1024 * 1024;
+/** Training-source ids per INSERT, so the id literal stays small however many a model names. */
+const TRAINING_SOURCE_BATCH = 10000;
 
 export interface PublishInput {
   version: string;
@@ -151,7 +155,7 @@ export function validatePublishInput(body: unknown): {
 export async function handlePostModels(req: Request, deps: ModelsDeps): Promise<Response> {
   const authed = authenticatePipeline(req, deps.pipelineKey);
   if (authed) return authed;
-  const { input, error } = validatePublishInput(await readJsonObject(req));
+  const { input, error } = validatePublishInput(await readJsonObject(req, MAX_PUBLISH_BODY_BYTES));
   if (error || !input) return invalid(error ?? "invalid body");
 
   const published = await transaction(deps.sql, async (tx) => {
@@ -182,17 +186,20 @@ export async function handlePostModels(req: Request, deps: ModelsDeps): Promise<
     // ("malformed array literal" 500s every publish). The literal is built in
     // JS instead: every id here passed isVideoId (64-char lowercase hex) in
     // validatePublishInput, so the joined literal cannot inject.
-    const idLiteral = `{${input.trainingSourceIds.join(",")}}`;
-    const recorded = await tx`
-      INSERT INTO model_training_sources (model_version, source_id)
-      SELECT ${input.version}, s.id FROM sources s
-      WHERE s.id = ANY(${idLiteral}::char(64)[])
-      ON CONFLICT DO NOTHING
-      RETURNING source_id`;
+    let recorded = 0;
+    for (let i = 0; i < input.trainingSourceIds.length; i += TRAINING_SOURCE_BATCH) {
+      const idLiteral = `{${input.trainingSourceIds.slice(i, i + TRAINING_SOURCE_BATCH).join(",")}}`;
+      const result = await tx`
+        INSERT INTO model_training_sources (model_version, source_id)
+        SELECT ${input.version}, s.id FROM sources s
+        WHERE s.id = ANY(${idLiteral}::char(64)[])
+        ON CONFLICT DO NOTHING`;
+      recorded += result.count;
+    }
     return {
       id: row.id as string,
       promotedAt: row.promoted_at as Date,
-      recorded: (recorded as unknown[]).length,
+      recorded,
     };
   });
 

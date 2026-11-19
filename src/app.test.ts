@@ -3,6 +3,10 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AppDeps, createHandler, startServer } from "./app";
+import { MAX_CLIPS_BODY_BYTES } from "./contrib/clips";
+import { MAX_JSON_BODY_BYTES } from "./contrib/validate";
+import { MAX_PUBLISH_BODY_BYTES } from "./models";
+import { MAX_QUARANTINE_BODY_BYTES } from "./quarantine";
 import { noDatabase, testCandidateKey } from "./auth/testing";
 import type { R2Client } from "./r2/client";
 import { TokenBucket, parseProxyRange } from "./ratelimit";
@@ -15,7 +19,7 @@ const noR2: R2Client = {
   presignGet: () => {
     throw new Error("r2 unavailable in this test");
   },
-  getBytes: () => {
+  getStream: () => {
     throw new Error("r2 unavailable in this test");
   },
   deleteObject: () => {
@@ -69,6 +73,22 @@ describe("createHandler routing", () => {
   test("POST /api/auth/apple reaches the sign-in handler", async () => {
     const res = await handle(new Request("http://farm.test/api/auth/apple", { method: "POST", body: "{}" }));
     expect(res.status).toBe(422);
+  });
+
+  test("a body over the route's cap answers 422 in the API error shape", async () => {
+    for (const path of ["/api/auth/apple", "/api/auth/apple/notifications", "/api/sources"]) {
+      const res = await handle(
+        new Request(`http://farm.test${path}`, { method: "POST", body: JSON.stringify({ pad: "x".repeat(MAX_JSON_BODY_BYTES) }) }),
+      );
+      expect(res.status).toBe(422);
+      expect(await res.json()).toEqual({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: `The request body exceeds ${MAX_JSON_BODY_BYTES} bytes`,
+          details: { maxBytes: MAX_JSON_BODY_BYTES },
+        },
+      });
+    }
   });
 
   test("POST /api/auth/signout reaches the sign-out handler", async () => {
@@ -335,6 +355,14 @@ describe("startServer", () => {
     const res = await fetch(new URL("/healthz", server.url));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "ok" });
+  });
+
+  test("refuses a body over every route's cap before any handler reads it", async () => {
+    const largest = Math.max(MAX_JSON_BODY_BYTES, MAX_CLIPS_BODY_BYTES, MAX_PUBLISH_BODY_BYTES, MAX_QUARANTINE_BODY_BYTES);
+    const res = await fetch(new URL("/healthz", server.url), { method: "POST", body: new Uint8Array(largest + 1) });
+    expect(res.status).toBe(413);
+    const under = await fetch(new URL("/healthz", server.url), { method: "POST", body: new Uint8Array(largest) });
+    expect(under.status).toBe(404);
   });
 
   test("POST /api/auth/apple/notifications is per-IP rate limited like sign-in", async () => {

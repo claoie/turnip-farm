@@ -43,12 +43,11 @@ export function isGapFrame(frame: Uint8Array<ArrayBuffer>): boolean {
   return true;
 }
 
-// Decode fail-closed (POSE_FORMAT.md §9): any header or size violation
-// rejects the whole blob.
-export function decodeTkp1(bytes: Uint8Array<ArrayBuffer>): DecodedTkp1 {
-  if (bytes.length < TKP1_HEADER_BYTES) {
-    throw new Tkp1Error(`too short for a header (${bytes.length} bytes)`);
-  }
+/**
+ * The 24-byte header's frame count and as-sent rate, validated fail-closed
+ * (POSE_FORMAT.md §9). `bytes` holds at least the header.
+ */
+export function decodeTkp1Header(bytes: Uint8Array<ArrayBuffer>): { frameCount: number; sourceSampleRateHz: number } {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const magic = String.fromCharCode(bytes[0]!, bytes[1]!, bytes[2]!, bytes[3]!);
   if (magic !== TKP1_MAGIC) throw new Tkp1Error(`bad magic ${JSON.stringify(magic)}`);
@@ -62,11 +61,20 @@ export function decodeTkp1(bytes: Uint8Array<ArrayBuffer>): DecodedTkp1 {
   if (frameCount < 1) throw new Tkp1Error(`frame_count ${frameCount} < 1`);
   const flags = view.getUint32(20, true);
   if (flags !== 0) throw new Tkp1Error(`unsupported flags ${flags}`);
+  return { frameCount, sourceSampleRateHz: readF32LE(view, 16) };
+}
+
+// Decode fail-closed (POSE_FORMAT.md §9): any header or size violation
+// rejects the whole blob.
+export function decodeTkp1(bytes: Uint8Array<ArrayBuffer>): DecodedTkp1 {
+  if (bytes.length < TKP1_HEADER_BYTES) {
+    throw new Tkp1Error(`too short for a header (${bytes.length} bytes)`);
+  }
+  const { frameCount, sourceSampleRateHz } = decodeTkp1Header(bytes);
   const expected = TKP1_HEADER_BYTES + TKP1_FRAME_BYTES * frameCount;
   if (bytes.length !== expected) {
     throw new Tkp1Error(`size ${bytes.length} != 24 + 204*${frameCount} (${expected})`);
   }
-  const sourceSampleRateHz = readF32LE(view, 16);
   const frames: Uint8Array<ArrayBuffer>[] = [];
   for (let i = 0; i < frameCount; i++) {
     frames.push(

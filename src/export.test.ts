@@ -19,8 +19,8 @@ afterAll(async () => {
 const PIPELINE_KEY = ["pipeline", "key", "for", "tests"].join("-");
 const authHeaders = { authorization: `Bearer ${PIPELINE_KEY}` };
 
-function deps(tx: TransactionSQL, pageLimit?: number): ExportDeps {
-  return { sql: tx as unknown as SQL, pipelineKey: PIPELINE_KEY, pageLimit };
+function deps(tx: TransactionSQL, pageLimit?: number, fetchRows?: number): ExportDeps {
+  return { sql: tx as unknown as SQL, pipelineKey: PIPELINE_KEY, pageLimit, fetchRows };
 }
 
 function get(path: string, headers: Record<string, string> = {}) {
@@ -222,6 +222,35 @@ describeDb("GET /api/labels/export", () => {
       const keys = all.map((r) => `${r.clip_id}|${r.trick_name}`);
       expect(new Set(keys).size).toBe(16);
       expect([...keys].sort()).toEqual(expectKeys);
+    });
+  });
+
+  test("a page read in several cursor fetches is byte-identical to one fetch, and to Response.json", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      for (const ch of ["a", "b", "c"]) {
+        await seedSource(tx, vid(ch));
+        for (let c = 0; c < 2; c++) {
+          const cid = clipId(ch.charCodeAt(0) * 10 + c);
+          await seedClip(tx, cid, vid(ch), { proposalModelVersion: "trick-v1", suggestedNames: ["cork"] });
+          await seedLabel(tx, cid, "cork");
+          await seedLabel(tx, cid, "gainer");
+        }
+      }
+      const read = async (d: ExportDeps) => {
+        const res = await handleGetLabelsExport(get("/api/labels/export", authHeaders), d);
+        expect(res.status).toBe(200);
+        expect(res.headers.get("content-type")).toBe("application/json;charset=utf-8");
+        return res.text();
+      };
+      // 12 rows; a page of 10 read 3 rows at a time crosses fetch boundaries mid-page.
+      const oneFetch = await read(deps(tx, 10));
+      const manyFetches = await read(deps(tx, 10, 3));
+      expect(manyFetches).toBe(oneFetch);
+      const parsed = JSON.parse(oneFetch);
+      expect(parsed.rows).toHaveLength(10);
+      expect(oneFetch).toBe(JSON.stringify(parsed));
+      // The cursor is closed: the same transaction can export again.
+      expect(await read(deps(tx, 10, 3))).toBe(oneFetch);
     });
   });
 

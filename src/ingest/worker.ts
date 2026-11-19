@@ -1,15 +1,17 @@
 // The ingest worker (BACKEND_DESIGN.md §1.2.10): turns a staged upload into
 // the canonical stored blob.
 //
-// Pipeline per staged source:
-//   1. Fetch the staged `.tkp1.gz`; re-verify its transport checksum when
+// Pipeline per staged source, streamed so no blob is ever held whole:
+//   1. Read the staged `.tkp1.gz`, gunzip, decode fail-closed, resample to
+//      canonical 10 Hz (POSE_FORMAT.md §6; gaps break interpolation) and
+//      gzip deterministically (mtime = 0), keeping only the canonical
+//      blob's size and digest; re-verify the staged transport checksum when
 //      the object carries one (R2 enforced a checksum at PUT time).
-//   2. Gunzip, decode fail-closed, resample to canonical 10 Hz
-//      (POSE_FORMAT.md §6; gaps break interpolation).
-//   3. Gzip deterministically (mtime = 0), PUT the canonical bytes to
-//      `r2_key` — the S3 PUT is atomic, so a failed PUT leaves no partial
-//      blob — then set `sources.sha256` to the digest of the stored bytes.
-//   4. Delete the staged object (best-effort; a failed delete is retried by
+//   2. Read and transform the staged object again, streaming the canonical
+//      bytes into a PUT to `r2_key` that declares that size and digest, so
+//      R2 refuses any byte that differs. The S3 PUT is atomic, so a failed
+//      PUT leaves no partial blob. Then set `sources.sha256` to the digest.
+//   3. Delete the staged object (best-effort; a failed delete is retried by
 //      the next poll — re-ingest is byte-identical, hence idempotent).
 //
 // Failure promise: a failed ingest leaves `sources.sha256`
@@ -19,16 +21,9 @@
 // bytes is never stored.
 
 import type { SQL } from "bun";
-import { BlobTooLargeError } from "../r2/client";
-import { type BlobStore } from "./store";
-import {
-  decodeTkp1,
-  encodeTkp1,
-  gunzipStaged,
-  gzipCanonical,
-  resampleToCanonical10Hz,
-  Tkp1Error,
-} from "./tkp1";
+import { BlobTooLargeError, MAX_CANONICAL_BLOB_BYTES } from "../r2/client";
+import { type BlobStore, type StoredObject } from "./store";
+import { canonicalizeStaged, Tkp1Error } from "./tkp1";
 
 // Key conventions: r2_key is pinned by the design doc (§1.2.9); the staging
 // key is the worker's own convention — deterministic per source, mirroring
@@ -81,6 +76,8 @@ export function createPostgresSourceStore(sql: SQL): SourceStore {
 export interface IngestDeps {
   store: BlobStore;
   sources: SourceStore;
+  /** Largest canonical blob stored, MAX_CANONICAL_BLOB_BYTES; tests lower it to cross it cheaply. */
+  maxCanonicalBytes?: number;
 }
 
 export type IngestResult = { status: "ingested"; sha256: string } | { status: "nothing-staged" };
@@ -90,39 +87,48 @@ export async function ingestStagedSource(deps: IngestDeps, sourceId: string): Pr
   const row = await deps.sources.get(sourceId);
   if (!row) throw new IngestError("unknown-source", sourceId);
 
-  let staged;
-  try {
-    staged = await deps.store.get(stagingKeyFor(sourceId));
-  } catch (err) {
-    // An oversized staged upload is a failed ingest, not a crash: keep it
-    // in the worker's failure contract so pollStagingOnce records it and
-    // moves on to the next source instead of stalling the poll.
-    if (err instanceof BlobTooLargeError) {
-      throw new IngestError("staged-too-large", `${stagingKeyFor(sourceId)} exceeds ${err.maxBytes} bytes`);
-    }
-    throw err;
-  }
+  const staged = await readStaged(deps.store, sourceId);
   if (staged === null) return { status: "nothing-staged" };
-
-  if (staged.checksumSha256 !== null) {
-    const actual = Buffer.from(await crypto.subtle.digest("SHA-256", staged.bytes)).toString("base64");
-    if (actual !== staged.checksumSha256) {
-      throw new IngestError("staged-checksum-mismatch", `object carries ${staged.checksumSha256}`);
-    }
-  }
-
-  let canonical: Uint8Array<ArrayBuffer>;
+  const maxCanonicalBytes = deps.maxCanonicalBytes ?? MAX_CANONICAL_BLOB_BYTES;
+  const stagedHasher = new Bun.CryptoHasher("sha256");
+  const canonicalHasher = new Bun.CryptoHasher("sha256");
+  let size = 0;
   try {
-    canonical = gzipCanonical(encodeTkp1(resampleToCanonical10Hz(decodeTkp1(await gunzipStaged(staged.bytes)))));
+    const hashed = staged.body.pipeThrough(
+      new TransformStream<Uint8Array<ArrayBuffer>, Uint8Array<ArrayBuffer>>({
+        transform(chunk, controller) {
+          stagedHasher.update(chunk);
+          controller.enqueue(chunk);
+        },
+      }),
+    );
+    for await (const chunk of canonicalizeStaged(hashed)) {
+      size += chunk.byteLength;
+      if (size > maxCanonicalBytes) {
+        throw new IngestError("canonical-too-large", `exceeds ${maxCanonicalBytes} bytes`);
+      }
+      canonicalHasher.update(chunk);
+    }
   } catch (err) {
-    if (err instanceof Tkp1Error) throw new IngestError("invalid-staged-blob", err.reason);
-    throw err;
+    throw ingestFailure(err, sourceId);
   }
+  if (staged.checksumSha256 !== null && stagedHasher.digest("base64") !== staged.checksumSha256) {
+    throw new IngestError("staged-checksum-mismatch", `object carries ${staged.checksumSha256}`);
+  }
+  const sha256 = canonicalHasher.digest();
+  const digest = sha256.toString("hex");
 
-  // The digest is over the stored bytes: exactly the payload of the PUT below.
-  const digest = new Bun.CryptoHasher("sha256").update(canonical).digest("hex");
-
-  await deps.store.put(row.r2_key, canonical, "application/gzip");
+  const again = await readStaged(deps.store, sourceId);
+  if (again === null) return { status: "nothing-staged" };
+  try {
+    await deps.store.put(
+      row.r2_key,
+      { body: canonicalizeStaged(again.body), size, sha256: new Uint8Array(sha256) },
+      "application/gzip",
+    );
+  } catch (err) {
+    throw ingestFailure(err, sourceId);
+  }
   await deps.sources.setSha256(sourceId, digest);
 
   try {
@@ -133,6 +139,25 @@ export async function ingestStagedSource(deps: IngestDeps, sourceId: string): Pr
     console.warn(`ingest: staged delete failed for ${sourceId}, retrying next poll:`, err);
   }
   return { status: "ingested", sha256: digest };
+}
+
+async function readStaged(store: BlobStore, sourceId: string): Promise<StoredObject | null> {
+  try {
+    return await store.get(stagingKeyFor(sourceId));
+  } catch (err) {
+    throw ingestFailure(err, sourceId);
+  }
+}
+
+// An oversized or invalid staged upload is a failed ingest, not a crash:
+// keep it in the worker's failure contract so pollStagingOnce records it
+// and moves on to the next source instead of stalling the poll.
+function ingestFailure(err: unknown, sourceId: string): unknown {
+  if (err instanceof BlobTooLargeError) {
+    return new IngestError("staged-too-large", `${stagingKeyFor(sourceId)} exceeds ${err.maxBytes} bytes`);
+  }
+  if (err instanceof Tkp1Error) return new IngestError("invalid-staged-blob", err.reason);
+  return err;
 }
 
 export interface PollSummary {
@@ -170,7 +195,11 @@ export async function pollStagingOnce(deps: IngestDeps): Promise<PollSummary> {
 // The "or poll" trigger: runs pollStagingOnce immediately and
 // then every intervalMs. Returns a stop function for tests and shutdown.
 export function startIngestPoller(deps: IngestDeps, intervalMs: number): () => void {
+  // A tick that outlasts the interval is not overlapped: one ingest at a time.
+  let polling = false;
   const tick = async (): Promise<void> => {
+    if (polling) return;
+    polling = true;
     try {
       const s = await pollStagingOnce(deps);
       if (s.checked > 0) {
@@ -179,6 +208,8 @@ export function startIngestPoller(deps: IngestDeps, intervalMs: number): () => v
       for (const f of s.failures) console.warn(`ingest failed for ${f.sourceId}: ${f.error}`);
     } catch (err) {
       console.error("ingest poll failed:", err);
+    } finally {
+      polling = false;
     }
   };
   void tick();

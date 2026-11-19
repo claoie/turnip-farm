@@ -111,11 +111,28 @@ function streamOf(chunks: number[]): ReadableStream<Uint8Array> {
   });
 }
 
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function upload(payload: Uint8Array<ArrayBuffer>, chunks: Uint8Array<ArrayBuffer>[] = [payload]) {
+  return {
+    body: new ReadableStream<Uint8Array<ArrayBuffer>>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    }),
+    size: payload.byteLength,
+    sha256: new Uint8Array(createHash("sha256").update(payload).digest()),
+  };
+}
+
 describe("R2BlobStore.get bounded download", () => {
   // The staged object is the uploader-controlled blob, so `get` must cap
-  // the download like the canonical path's getBytes: a declared
+  // the download like the canonical path's getStream: a declared
   // content-length over the cap rejects before reading, and a chunked
-  // stream rejects once the running total passes the cap. The cap is set
+  // stream errors once the running total passes the cap. The cap is set
   // explicitly small here (10 bytes) so removing it from `get` fails
   // these tests instead of passing silently at the 64 MiB default.
   test("returns bytes and checksum when under the explicit cap", async () => {
@@ -129,7 +146,7 @@ describe("R2BlobStore.get bounded download", () => {
     );
     const store = new R2BlobStore(CFG, { fetch, now: () => NOW, maxBytes: 10 });
     const got = await store.get(KEY);
-    expect(got?.bytes).toEqual(data);
+    expect(await readAll(got!.body)).toEqual(data);
     expect(got?.checksumSha256).toBe("abc==");
   });
 
@@ -137,17 +154,17 @@ describe("R2BlobStore.get bounded download", () => {
     const { fetch } = capturingFetch(() => new Response(streamOf([3, 4]), { status: 200 }));
     const store = new R2BlobStore(CFG, { fetch, now: () => NOW, maxBytes: 10 });
     const got = await store.get(KEY);
-    expect(got?.bytes).toEqual(new Uint8Array(7));
+    expect(await readAll(got!.body)).toEqual(new Uint8Array(7));
   });
 
-  test("rejects once streamed chunks exceed the cap", async () => {
+  test("errors the stream once streamed chunks exceed the cap", async () => {
     // A fresh stub per call: a consumed stream cannot be re-read.
     const makeStore = () => {
       const { fetch } = capturingFetch(() => new Response(streamOf([6, 6]), { status: 200 }));
       return new R2BlobStore(CFG, { fetch, now: () => NOW, maxBytes: 10 });
     };
-    await expect(makeStore().get(KEY)).rejects.toBeInstanceOf(BlobTooLargeError);
-    await expect(makeStore().get(KEY)).rejects.toThrow(/exceeds 10 bytes/);
+    await expect(readAll((await makeStore().get(KEY))!.body)).rejects.toBeInstanceOf(BlobTooLargeError);
+    await expect(readAll((await makeStore().get(KEY))!.body)).rejects.toThrow(/exceeds 10 bytes/);
   });
 
   test("rejects on a declared content-length over the cap", async () => {
@@ -175,7 +192,7 @@ describe("R2BlobStore signing", () => {
     const store = new R2BlobStore(CFG, { fetch, now: () => NOW });
     const got = await store.get("poses/abcd.tkp1.gz");
 
-    expect(got?.bytes).toEqual(new Uint8Array([1, 2, 3]));
+    expect(await readAll(got!.body)).toEqual(new Uint8Array([1, 2, 3]));
     expect(got?.checksumSha256).toBe("abc==");
     expect(calls).toHaveLength(1);
     const call = calls[0]!;
@@ -206,11 +223,11 @@ describe("R2BlobStore signing", () => {
     );
   });
 
-  test("PUT signs content-type and the checksum header, and sends both", async () => {
+  test("PUT signs content-type and the checksum header, and streams the body with its length", async () => {
     const payload = new TextEncoder().encode("hi");
     const { fetch, calls } = capturingFetch(() => new Response(null, { status: 200 }));
     const store = new R2BlobStore(CFG, { fetch, now: () => NOW });
-    await store.put("staging/x.tkp1.gz", payload, "application/octet-stream");
+    await store.put("staging/x.tkp1.gz", upload(payload, [payload.slice(0, 1), payload.slice(1)]), "application/octet-stream");
 
     expect(calls).toHaveLength(1);
     const call = calls[0]!;
@@ -237,7 +254,16 @@ describe("R2BlobStore signing", () => {
         NOW,
       ),
     );
-    expect(call.init.body).toBe(payload);
+    expect(headers["content-length"]).toBe("2");
+    expect(await readAll(call.init.body as ReadableStream<Uint8Array>)).toEqual(payload);
+  });
+
+  test("PUT refuses a body longer than its declared size", async () => {
+    const { fetch, calls } = capturingFetch(() => new Response(null, { status: 200 }));
+    const store = new R2BlobStore(CFG, { fetch, now: () => NOW });
+    const payload = new TextEncoder().encode("hi");
+    await store.put("staging/x.tkp1.gz", { ...upload(payload), size: 1 }, "application/gzip");
+    await expect(readAll(calls[0]!.init.body as ReadableStream<Uint8Array>)).rejects.toThrow(/body exceeds 1 bytes/);
   });
 
   test("path segments are encoded and slashes stay separators", async () => {

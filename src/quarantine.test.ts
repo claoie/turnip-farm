@@ -35,7 +35,7 @@ function fakeR2(opts: { failDelete?: boolean } = {}): R2Client & { deleted: stri
     presignGet: () => {
       throw new Error("r2 unavailable in this test");
     },
-    getBytes: () => {
+    getStream: () => {
       throw new Error("r2 unavailable in this test");
     },
     deleteObject: async (key: string) => {

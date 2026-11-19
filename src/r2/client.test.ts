@@ -1,4 +1,4 @@
-// Bounded getBytes for the contribution endpoints.
+// Bounded getStream for the contribution endpoints.
 // Pure unit tests (no DB): the fetch is stubbed, the SigV4 URL is real but
 // never leaves the process.
 
@@ -47,18 +47,22 @@ function streamOf(chunks: number[]): ReadableStream<Uint8Array> {
   });
 }
 
-describe("getBytes", () => {
-  test("returns the bytes when under the cap", async () => {
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+describe("getStream", () => {
+  test("streams the bytes when under the cap", async () => {
     const data = new Uint8Array([1, 2, 3, 4]);
     const r2 = createR2Client(CFG, { fetch: stubFetch(data) });
-    const got = await r2.getBytes(KEY, { maxBytes: 10 });
-    expect(got).toEqual(data);
+    const got = await r2.getStream(KEY, { maxBytes: 10 });
+    expect(await readAll(got!)).toEqual(data);
   });
 
   test("streams chunked bodies without a content-length", async () => {
     const r2 = createR2Client(CFG, { fetch: stubFetch(streamOf([3, 4])) });
-    const got = await r2.getBytes(KEY, { maxBytes: 10 });
-    expect(got).toEqual(new Uint8Array(7));
+    const got = await r2.getStream(KEY, { maxBytes: 10 });
+    expect(await readAll(got!)).toEqual(new Uint8Array(7));
   });
 
   test("fast-rejects when content-length already exceeds the cap", async () => {
@@ -67,43 +71,64 @@ describe("getBytes", () => {
         headers: { "content-length": "100" },
       }),
     });
-    const err = await r2.getBytes(KEY, { maxBytes: 10 }).catch((e) => e);
+    const err = await r2.getStream(KEY, { maxBytes: 10 }).catch((e) => e);
     expect(err).toBeInstanceOf(BlobTooLargeError);
     expect((err as BlobTooLargeError).key).toBe(KEY);
     expect((err as BlobTooLargeError).maxBytes).toBe(10);
   });
 
-  test("counts the stream when the declared length lies", async () => {
+  test("errors the stream when the declared length lies", async () => {
     const r2 = createR2Client(CFG, {
       fetch: stubFetch(streamOf([8, 8]), {
         headers: { "content-length": "4" },
       }),
     });
-    await expect(r2.getBytes(KEY, { maxBytes: 10 })).rejects.toBeInstanceOf(
-      BlobTooLargeError,
-    );
+    const got = await r2.getStream(KEY, { maxBytes: 10 });
+    await expect(readAll(got!)).rejects.toBeInstanceOf(BlobTooLargeError);
+  });
+
+  test("stops reading the body once the cap is passed", async () => {
+    let pulled = 0;
+    let cancelled = false;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled++;
+        controller.enqueue(new Uint8Array(4));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const r2 = createR2Client(CFG, { fetch: stubFetch(endless) });
+    const got = await r2.getStream(KEY, { maxBytes: 10 });
+    await expect(readAll(got!)).rejects.toBeInstanceOf(BlobTooLargeError);
+    expect(cancelled).toBe(true);
+    expect(pulled).toBeLessThan(10);
   });
 
   test("accepts a blob exactly at the cap", async () => {
     const r2 = createR2Client(CFG, { fetch: stubFetch(new Uint8Array(10)) });
-    const got = await r2.getBytes(KEY, { maxBytes: 10 });
-    expect(got).toEqual(new Uint8Array(10));
+    const got = await r2.getStream(KEY, { maxBytes: 10 });
+    expect(await readAll(got!)).toEqual(new Uint8Array(10));
   });
 
   test("defaults to MAX_CANONICAL_BLOB_BYTES", async () => {
     expect(MAX_CANONICAL_BLOB_BYTES).toBe(64 * 1024 * 1024);
-    const r2 = createR2Client(CFG, { fetch: stubFetch(new Uint8Array(3)) });
-    const got = await r2.getBytes(KEY);
-    expect(got).toEqual(new Uint8Array(3));
+    const declaring = (n: number) =>
+      createR2Client(CFG, {
+        fetch: stubFetch(new Uint8Array(0), { headers: { "content-length": String(n) } }),
+      });
+    await expect(declaring(MAX_CANONICAL_BLOB_BYTES + 1).getStream(KEY)).rejects.toBeInstanceOf(BlobTooLargeError);
+    expect(await declaring(MAX_CANONICAL_BLOB_BYTES).getStream(KEY)).not.toBeNull();
   });
 
   test("returns null on 404", async () => {
     const r2 = createR2Client(CFG, { fetch: stubFetch(null, { status: 404 }) });
-    expect(await r2.getBytes(KEY)).toBeNull();
+    expect(await r2.getStream(KEY)).toBeNull();
   });
 
   test("throws on non-404 error statuses", async () => {
     const r2 = createR2Client(CFG, { fetch: stubFetch(null, { status: 500 }) });
-    await expect(r2.getBytes(KEY)).rejects.toThrow(/R2 GET .* failed: 500/);
+    await expect(r2.getStream(KEY)).rejects.toThrow(/R2 GET .* failed: 500/);
   });
 });

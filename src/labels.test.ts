@@ -40,7 +40,7 @@ const r2: R2Client = {
   presignGet: () => {
     throw new Error("not used");
   },
-  getBytes: async () => BLOB,
+  getStream: async () => new Blob([BLOB]).stream(),
   deleteObject: async () => {},
 };
 

@@ -28,6 +28,8 @@ export interface QuarantineDeps extends PipelineDeps {
 }
 
 const MAX_SOURCE_IDS = 10000;
+/** MAX_SOURCE_IDS quoted ids at 67 bytes each, plus the reason and metrics. */
+export const MAX_QUARANTINE_BODY_BYTES = 1024 * 1024;
 const MAX_REASON_LEN = 1000;
 
 const notFound = () => errorResponse(404, "NOT_FOUND", "Not found");
@@ -41,7 +43,7 @@ interface QuarantineInput {
 }
 
 async function readQuarantineInput(req: Request): Promise<{ input?: QuarantineInput; error?: Response }> {
-  const body = await readJsonObject(req);
+  const body = await readJsonObject(req, MAX_QUARANTINE_BODY_BYTES);
   if (!body) return { error: invalid("body must be a JSON object") };
   const { source_ids, reason, metrics } = body;
 
