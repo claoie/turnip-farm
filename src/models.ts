@@ -17,6 +17,7 @@ import { errorResponse } from "./errors";
 import { transaction } from "./db";
 import { authenticatePipeline, type PipelineDeps } from "./pipeline";
 import { isVideoId, readJsonObject } from "./contrib/validate";
+import { heavyJobs } from "./heavy-jobs";
 import type { R2Client } from "./r2/client";
 import { buildVocabulary } from "./taxonomy";
 
@@ -155,6 +156,10 @@ export function validatePublishInput(body: unknown): {
 export async function handlePostModels(req: Request, deps: ModelsDeps): Promise<Response> {
   const authed = authenticatePipeline(req, deps.pipelineKey);
   if (authed) return authed;
+  return heavyJobs.use(() => publish(req, deps));
+}
+
+async function publish(req: Request, deps: ModelsDeps): Promise<Response> {
   const { input, error } = validatePublishInput(await readJsonObject(req, MAX_PUBLISH_BODY_BYTES));
   if (error || !input) return invalid(error ?? "invalid body");
 

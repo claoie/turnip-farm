@@ -11,6 +11,7 @@
 
 import { transaction } from "./db";
 import { errorResponse } from "./errors";
+import { heavyJobs } from "./heavy-jobs";
 import { authenticatePipeline, type PipelineDeps } from "./pipeline";
 import { isUuid } from "./contrib/validate";
 
@@ -178,7 +179,10 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
     if (!decoded) return invalid("since must be the opaque cursor from a previous next_cursor");
     cursor = decoded;
   }
+  return heavyJobs.use(() => exportPage(deps, cursor, limit));
+}
 
+async function exportPage(deps: ExportDeps, cursor: Cursor, limit: number): Promise<Response> {
   const fetchRows = deps.fetchRows ?? EXPORT_FETCH_ROWS;
   const page = await transaction(deps.sql, async (tx) => {
     await declareRowCursor(tx, cursor, limit);

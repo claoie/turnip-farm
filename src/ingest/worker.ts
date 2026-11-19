@@ -21,6 +21,7 @@
 // bytes is never stored.
 
 import type { SQL } from "bun";
+import { heavyJobs } from "../heavy-jobs";
 import { BlobTooLargeError, MAX_CANONICAL_BLOB_BYTES } from "../r2/client";
 import { type BlobStore, type StoredObject } from "./store";
 import { canonicalizeStaged, Tkp1Error } from "./tkp1";
@@ -82,7 +83,11 @@ export interface IngestDeps {
 
 export type IngestResult = { status: "ingested"; sha256: string } | { status: "nothing-staged" };
 
-export async function ingestStagedSource(deps: IngestDeps, sourceId: string): Promise<IngestResult> {
+export function ingestStagedSource(deps: IngestDeps, sourceId: string): Promise<IngestResult> {
+  return heavyJobs.use(() => ingest(deps, sourceId));
+}
+
+async function ingest(deps: IngestDeps, sourceId: string): Promise<IngestResult> {
   if (!/^[0-9a-f]{64}$/.test(sourceId)) throw new IngestError("bad-source-id", sourceId);
   const row = await deps.sources.get(sourceId);
   if (!row) throw new IngestError("unknown-source", sourceId);

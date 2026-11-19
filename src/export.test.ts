@@ -7,6 +7,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { TEST_DATABASE_URL, inRollback } from "../db/testing";
 import { sha256Hex } from "./auth/tokens";
 import { HOLD_BACK_MIN_CONTRIBUTORS, handleGetLabelsExport, type ExportDeps } from "./export";
+import { canonicalKeyFor, ingestStagedSource } from "./ingest/worker";
 
 const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -251,6 +252,42 @@ describeDb("GET /api/labels/export", () => {
       expect(oneFetch).toBe(JSON.stringify(parsed));
       // The cursor is closed: the same transaction can export again.
       expect(await read(deps(tx, 10, 3))).toBe(oneFetch);
+    });
+  });
+
+  test("an export page waits while an ingest runs", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      let release!: () => void;
+      const staged = new Promise<void>((resolve) => (release = resolve));
+      const ingesting = ingestStagedSource(
+        {
+          store: {
+            async get() {
+              await staged;
+              return null;
+            },
+            async put() {},
+            async delete() {},
+            async *listPages() {},
+          },
+          sources: {
+            async get(id) {
+              return { id, r2_key: canonicalKeyFor(id) };
+            },
+            async setSha256() {},
+          },
+        },
+        vid("e"),
+      );
+      let answered = false;
+      const exporting = handleGetLabelsExport(get("/api/labels/export", authHeaders), deps(tx)).finally(
+        () => (answered = true),
+      );
+      await Bun.sleep(30);
+      expect(answered).toBe(false);
+      release();
+      await ingesting;
+      expect((await exporting).status).toBe(200);
     });
   });
 
