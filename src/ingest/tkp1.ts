@@ -1,4 +1,4 @@
-import { createGzip } from "node:zlib";
+import { constants, crc32, deflateRawSync } from "node:zlib";
 import { MAX_CANONICAL_BLOB_BYTES } from "../r2/client";
 import {
   CANONICAL_HZ,
@@ -123,6 +123,8 @@ export function resampleToCanonical10Hz(decoded: DecodedTkp1): DecodedTkp1 {
   return { frameCount: resampler.outCount, sourceSampleRateHz: decoded.sourceSampleRateHz, frames };
 }
 
+const CANONICAL_NAN_BITS = 0x7fc00000;
+
 function interpolateFrame(
   a: Uint8Array<ArrayBuffer>,
   b: Uint8Array<ArrayBuffer>,
@@ -134,15 +136,23 @@ function interpolateFrame(
   const vo = new DataView(out.buffer);
   for (let c = 0; c < TKP1_KEYPOINT_COUNT * 3; c++) {
     const v = (1 - frac) * va.getFloat32(c * 4, true) + frac * vb.getFloat32(c * 4, true);
-    vo.setFloat32(c * 4, v, true);
+    // setFloat32 may write any NaN encoding, and two reads of one upload got
+    // different ones; one fixed NaN keeps the canonical bytes reproducible.
+    if (Number.isNaN(v)) vo.setUint32(c * 4, CANONICAL_NAN_BITS, true);
+    else vo.setFloat32(c * 4, v, true);
   }
   return out;
 }
 
-// gzip's output depends on how its input is split and when it runs, so it
-// is fed blocks of this size, one at a time: every read of a blob yields
-// the same canonical bytes, whatever the staged stream's chunking.
+// The canonical blob is deflated in blocks of this size, each on its own, so
+// its bytes depend on the blob alone: every read of an upload yields the same
+// bytes, whatever the staged stream's chunking or timing. A streaming
+// compressor doesn't promise that: CompressionStream's output shifts with
+// how fast blocks reach it.
 const GZIP_BLOCK_BYTES = 64 * 1024;
+
+// RFC 1952 member header: deflate, no flags, mtime 0, OS unknown.
+const GZIP_HEADER = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
 
 /**
  * The canonical `.tkp1.gz` for a staged upload, produced as it is read:
@@ -172,26 +182,25 @@ export function canonicalizeStaged(
   );
 }
 
+// One gzip member around the blocks' deflate output. Each block is
+// sync-flushed rather than finished, so the next block's data continues the
+// same deflate stream, and a final empty block ends it.
 async function* gzipBlocks(blocks: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array<ArrayBuffer>> {
-  const gzip = createGzip();
-  const out: Uint8Array<ArrayBuffer>[] = [];
-  gzip.on("data", (chunk: Buffer) => out.push(new Uint8Array(chunk)));
-  const ended = new Promise<void>((resolve, reject) => {
-    gzip.on("end", resolve);
-    gzip.on("error", reject);
-  });
-  ended.catch(() => {});
-  try {
-    for await (const block of blocks) {
-      await new Promise<void>((resolve, reject) => gzip.write(block, (err) => (err ? reject(err) : resolve())));
-      while (out.length > 0) yield out.shift()!;
-    }
-    gzip.end();
-    await ended;
-    while (out.length > 0) yield out.shift()!;
-  } finally {
-    gzip.destroy();
+  yield new Uint8Array(GZIP_HEADER);
+  let crc = 0;
+  let size = 0;
+  for await (const block of blocks) {
+    crc = crc32(block, crc);
+    size += block.byteLength;
+    yield new Uint8Array(deflateRawSync(block, { finishFlush: constants.Z_SYNC_FLUSH }));
   }
+  const end = deflateRawSync(new Uint8Array(0));
+  const trailer = new Uint8Array(end.byteLength + 8);
+  trailer.set(end);
+  const view = new DataView(trailer.buffer);
+  view.setUint32(end.byteLength, crc >>> 0, true);
+  view.setUint32(end.byteLength + 4, size >>> 0, true);
+  yield trailer;
 }
 
 async function* gunzipCapped(

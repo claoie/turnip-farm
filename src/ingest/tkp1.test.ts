@@ -125,6 +125,27 @@ describe("canonicalizeStaged", () => {
     for (const output of outputs.slice(1)) expect(output).toEqual(outputs[0]!);
   });
 
+  test("a single gzip member, mtime 0, that standard decoders read with its CRC and size checked", async () => {
+    const blob = makeBlob(1000, 10, motion);
+    const out = await readAll(canonicalizeStaged(staged(Bun.gzipSync(blob))));
+    expect([...out.subarray(0, 8)]).toEqual([0x1f, 0x8b, 8, 0, 0, 0, 0, 0]);
+    expect(Bun.gunzipSync(out)).toEqual(blob);
+    expect(await readAll(new Blob([out]).stream().pipeThrough(new DecompressionStream("gzip")))).toEqual(blob);
+    const corrupt = out.slice();
+    corrupt[corrupt.length - 5]! ^= 1; // a CRC byte
+    expect(() => Bun.gunzipSync(corrupt)).toThrow();
+  });
+
+  test("an interpolated NaN is written as one fixed NaN", async () => {
+    const blob = makeBlob(5, 24, (i, k) => (k === 0 ? [i === 2 ? NaN : 0.5, 0.2, 0.9] : [0, 0, 0.9]));
+    const view = new DataView(blob.buffer);
+    // A NaN with a nonstandard payload in frame 2's nose x.
+    view.setUint32(24 + 2 * 204, 0x7fa00001, true);
+    const out = Bun.gunzipSync(await readAll(canonicalizeStaged(staged(Bun.gzipSync(blob)))));
+    // Canonical frame 1 sits at p = 2.4, between source frames 2 and 3.
+    expect(new DataView(out.buffer).getUint32(24 + 204, true)).toBe(0x7fc00000);
+  });
+
   test.each(MUTATIONS)("fail-closed on %s", async (_, mutate) => {
     const gz = Bun.gzipSync(mutate(section111()));
     await expect(readAll(canonicalizeStaged(staged(gz, 5)))).rejects.toBeInstanceOf(Tkp1Error);

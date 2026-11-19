@@ -90,16 +90,16 @@ describe("getStream", () => {
   test("stops reading the body once the cap is passed", async () => {
     let pulled = 0;
     let cancelled = false;
-    const endless = new ReadableStream<Uint8Array>({
+    const long = new ReadableStream<Uint8Array>({
       pull(controller) {
-        pulled++;
-        controller.enqueue(new Uint8Array(4));
+        if (++pulled > 1000) controller.close();
+        else controller.enqueue(new Uint8Array(4));
       },
       cancel() {
         cancelled = true;
       },
     });
-    const r2 = createR2Client(CFG, { fetch: stubFetch(endless) });
+    const r2 = createR2Client(CFG, { fetch: stubFetch(long) });
     const got = await r2.getStream(KEY, { maxBytes: 10 });
     await expect(readAll(got!)).rejects.toBeInstanceOf(BlobTooLargeError);
     expect(cancelled).toBe(true);

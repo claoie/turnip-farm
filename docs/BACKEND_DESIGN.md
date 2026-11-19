@@ -85,7 +85,9 @@ Two departures from the master plan's label draft follow from this:
       non-10 Hz contribution, so it is never stored.
     A farm-side ingest worker resamples the staged upload to canonical
     10 Hz, stores it at `r2_key`, sets `sources.sha256`, and deletes the
-    staged object. Clip submission re-verifies the stored blob against
+    staged object. It streams both, never holding a blob whole: a staged
+    upload over `MAX_CANONICAL_BLOB_BYTES`, compressed or decompressed, or
+    one whose canonical blob would be, fails ingest and stays staged. Clip submission re-verifies the stored blob against
     `sources.sha256` (`422 BLOB_DIGEST_MISMATCH`); a NULL digest means
     the blob is not ingested yet (`422 BLOB_MISSING`). A source row
     registered but never uploaded is a harmless dangling row that
@@ -1259,6 +1261,12 @@ for `users.apple_refresh_token`).
     that sends a false country gets past it, and the farm can't tell.
   - **Not kept:** the value is read only to decide the refusal; it is
     never stored or logged (§8).
+- **Request bodies** are read as they arrive, up to a cap per route:
+  1 MiB for `POST /api/clips` (about 3,000 clips) and
+  `POST /api/quarantine`, 8 MiB for `POST /api/models` (100,000 training
+  source ids), 64 KiB for every other route. A body over its route's cap
+  gets `422 VALIDATION_ERROR` with `details.maxBytes`; one over 8 MiB is
+  refused by the server with a bare `413` before any route reads it.
 - **Rate limiting:** per-user token bucket on POST endpoints
   (suggested: 60 requests/minute; `429 RATE_LIMITED` with
   `Retry-After`). `POST /api/auth/apple` has no user yet, so it is
@@ -2109,12 +2117,14 @@ Response `200`: `{"source_id": "<id>", "holdout": true, "changed": true}`.
 
 The canonical `poses/<id>.tkp1.gz` bytes as stored, `Content-Type:
 application/gzip`, for the page's player to decode (POSE_FORMAT.md).
-The farm reads the blob from R2 and returns it rather than presigning
-a URL: a browser fetch of a presigned R2 URL needs a CORS rule on the
-bucket, which the app's downloads don't, and the farm already reads
+The farm streams the blob from R2 through to the browser rather than
+presigning a URL: a browser fetch of a presigned R2 URL needs a CORS rule
+on the bucket, which the app's downloads don't, and the farm already reads
 canonical blobs under the `MAX_CANONICAL_BLOB_BYTES` cap. `404` for an
 unknown source; `422 BLOB_MISSING` when the source isn't ingested yet
-or its blob is gone from R2; `422 BLOB_TOO_LARGE` over the cap.
+or its blob is gone from R2; `422 BLOB_TOO_LARGE` when its declared size
+is over the cap. A blob that passes the cap without declaring its size is
+cut off mid-response.
 
 #### `POST /api/reports` — report a bad label/clip
 
