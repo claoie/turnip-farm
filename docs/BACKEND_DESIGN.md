@@ -641,6 +641,8 @@ CREATE TABLE model_training_source_pages (
   -- after they arrive. No account column.
   PRIMARY KEY (model_version, model_sha256, source_id)
 );
+CREATE INDEX model_training_source_pages_staged_at_idx
+  ON model_training_source_pages (staged_at);
 
 CREATE TABLE data_quarantine (
   id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
