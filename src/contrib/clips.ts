@@ -22,6 +22,7 @@ import {
   type R2Client,
 } from "../r2/client";
 import type { RateLimits } from "../app";
+import { Slots } from "../slots";
 import {
   isSourceKey,
   isUuid,
@@ -44,6 +45,14 @@ export interface ClipsDeps {
 
 /** About 3,000 clips; the app sends one source's clips per batch. */
 export const MAX_CLIPS_BODY_BYTES = 1024 * 1024;
+
+/**
+ * Source blobs verified at once across all submissions; the rest wait.
+ * Each verification holds read and socket buffers while it streams a blob
+ * of up to MAX_CANONICAL_BLOB_BYTES, so the count bounds their sum.
+ */
+export const CONCURRENT_BLOB_VERIFICATIONS = 2;
+const blobVerifications = new Slots(CONCURRENT_BLOB_VERIFICATIONS);
 
 const notFound = () => errorResponse(404, "NOT_FOUND", "Not found");
 
@@ -205,8 +214,10 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
     }
     let digest: string | null;
     try {
-      const body = await deps.r2.getStream(s.r2_key);
-      digest = body === null ? null : await sha256HexStream(body);
+      digest = await blobVerifications.use(async () => {
+        const body = await deps.r2.getStream(s.r2_key);
+        return body === null ? null : await sha256HexStream(body);
+      });
     } catch (e) {
       if (e instanceof BlobTooLargeError) {
         return errorResponse(422, "BLOB_TOO_LARGE", `source ${sourceId}: blob exceeds ${MAX_CANONICAL_BLOB_BYTES} bytes`, { details: {} });

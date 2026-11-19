@@ -18,7 +18,7 @@ import {
   handleRegisterSource,
   type SourcesDeps,
 } from "./sources";
-import { handlePostClipLabels, handlePostClips, type ClipsDeps } from "./clips";
+import { CONCURRENT_BLOB_VERIFICATIONS, handlePostClipLabels, handlePostClips, type ClipsDeps } from "./clips";
 
 const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -545,6 +545,51 @@ describeDb("POST /api/clips", () => {
         422,
         "BLOB_DIGEST_MISMATCH",
       );
+    });
+  });
+
+  test("at most CONCURRENT_BLOB_VERIFICATIONS submissions stream a source blob at once", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      const blob = new TextEncoder().encode("b");
+      await seedIngestedSource(tx, token, createHash("sha256").update(blob).digest("hex"));
+      const finish: (() => void)[] = [];
+      let open = 0;
+      let mostOpen = 0;
+      const r2: R2Client = {
+        ...fakeR2(),
+        getStream: async () => {
+          mostOpen = Math.max(mostOpen, ++open);
+          return new ReadableStream<Uint8Array<ArrayBuffer>>({
+            start(controller) {
+              finish.push(() => {
+                open--;
+                controller.enqueue(blob.slice());
+                controller.close();
+              });
+            },
+          });
+        },
+      };
+      const d = deps(tx, r2);
+      let settled = 0;
+      const submissions = [0, 1, 2, 3].map(() =>
+        handlePostClips(post("/api/clips", clipBody(), authed(token)), d).finally(() => settled++),
+      );
+      const until = async (done: () => boolean) => {
+        for (let i = 0; i < 400 && !done(); i++) await Bun.sleep(5);
+      };
+      await until(() => finish.length === CONCURRENT_BLOB_VERIFICATIONS);
+      await Bun.sleep(30);
+      expect(finish).toHaveLength(CONCURRENT_BLOB_VERIFICATIONS);
+      // One stream at a time, so only one submission is in its transaction.
+      for (let i = 0; i < 4; i++) {
+        await until(() => finish.length > i);
+        finish[i]!();
+        await until(() => settled > i);
+      }
+      expect((await Promise.all(submissions)).map((res) => res.status)).toEqual([200, 200, 200, 200]);
+      expect(mostOpen).toBe(CONCURRENT_BLOB_VERIFICATIONS);
     });
   });
 
